@@ -2,6 +2,7 @@ package cf_http_ratelimiter
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -32,7 +33,8 @@ func setupLimiter(t *testing.T, opts ...Option) (*RateLimiter, valkey.Client) {
 	if err := fw.AddComponent(vk); err != nil {
 		t.Fatalf("AddComponent valkey: %v", err)
 	}
-	r := New(opts...)
+	defaults := []Option{WithWaitMissingTTLPolicy("proceed")}
+	r := New(append(defaults, opts...)...)
 	if err := fw.AddComponent(r); err != nil {
 		t.Fatalf("AddComponent ratelimiter: %v", err)
 	}
@@ -210,8 +212,83 @@ func TestIntegrationAtomicity(t *testing.T) {
 	}
 }
 
+func TestIntegrationWaitAndPeekForWait(t *testing.T) {
+	r, _ := setupLimiter(t, WithWaitJitterMax(0))
+	ctx := context.Background()
+	logical := "wait-key"
+	if _, err := r.Allow(ctx, logical, 1, 80*time.Millisecond); err != nil {
+		t.Fatalf("Allow fill: %v", err)
+	}
+	start := time.Now()
+	if err := r.Wait(ctx, logical, 1, 80*time.Millisecond); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if time.Since(start) < 50*time.Millisecond {
+		t.Fatal("Wait returned too quickly; peekForWait should have seen a full window")
+	}
+	// Fill again, then cancel WaitOpts mid-sleep (exercises valkey peekForWait).
+	if _, err := r.Allow(ctx, logical, 1, time.Hour); err != nil {
+		t.Fatalf("Allow refill: %v", err)
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	if err := r.WaitOpts(ctx2, logical, 1, time.Hour, WaitOptions{}); err == nil {
+		t.Fatal("WaitOpts should cancel when ctx expires")
+	}
+}
+
+func TestIntegrationMissingTTLProceedAndError(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("proceed", func(t *testing.T) {
+		r, raw := setupLimiter(t, WithWaitMissingTTLPolicy("proceed"))
+		logical := "orphan-proceed"
+		storeKey := r.Key(logical)
+		if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("3").Build()).Error(); err != nil {
+			t.Fatalf("SET without TTL: %v", err)
+		}
+		res, err := r.Peek(ctx, logical)
+		if err != nil {
+			t.Fatalf("Peek missing TTL proceed: %v", err)
+		}
+		if res.Count != 0 {
+			t.Fatalf("after scrub Peek count = %d, want 0", res.Count)
+		}
+		if r.missingTTL.Load() < 1 {
+			t.Fatal("missingTTL counter should increment")
+		}
+		// Key should be gone so Allow starts a fresh window.
+		res, err = r.Allow(ctx, logical, 5, time.Minute)
+		if err != nil || !res.Allowed || res.Count != 1 {
+			t.Fatalf("Allow after scrub = %+v err=%v", res, err)
+		}
+	})
+
+	t.Run("error", func(t *testing.T) {
+		r, raw := setupLimiter(t, WithWaitMissingTTLPolicy("error"))
+		logical := "orphan-error"
+		storeKey := r.Key(logical)
+		if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("2").Build()).Error(); err != nil {
+			t.Fatalf("SET without TTL: %v", err)
+		}
+		_, err := r.Peek(ctx, logical)
+		if !errors.Is(err, ErrMissingTTL) {
+			t.Fatalf("Peek missing TTL error = %v, want ErrMissingTTL", err)
+		}
+		_, err = r.Allow(ctx, logical, 5, time.Minute)
+		// After Peek scrubbed the key, Allow may succeed — re-seed without TTL.
+		if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("2").Build()).Error(); err != nil {
+			t.Fatalf("re-SET: %v", err)
+		}
+		_, err = r.Allow(ctx, logical, 5, time.Minute)
+		if !errors.Is(err, ErrMissingTTL) {
+			t.Fatalf("Allow missing TTL error = %v, want ErrMissingTTL", err)
+		}
+	})
+}
+
 func TestIntegrationMemoryFallbackUnderValkey(t *testing.T) {
-	r, raw := setupLimiter(t)
+	r, raw := setupLimiter(t, WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"))
 	ctx := context.Background()
 
 	if _, err := r.Allow(ctx, "k", 10, time.Minute); err != nil {

@@ -16,9 +16,9 @@ type memEntry struct {
 	window      time.Duration
 }
 
-// memoryLimiter is the process-local fixed-window counter used by the unlocked
-// memory backend (WithMemoryBackend) and by the StorageMemoryFallback policy.
-// The component owns one shared instance, so "the map" is one thing with one
+// memoryLimiter is the process-local fixed-window counter used when the
+// sticky-note path is active (use_memory_fallback / force_memory / MemoryFallback). The
+// component owns one shared instance, so "the map" is one thing with one
 // http_ratelimiter_memory_entries gauge. Sizing (cap, map-full policy) is
 // passed per call so reload tunables apply without rebuilding the map.
 type memoryLimiter struct {
@@ -32,10 +32,22 @@ func newMemoryLimiter() *memoryLimiter {
 	return &memoryLimiter{entries: make(map[string]*memEntry)}
 }
 
+// sweepExpiredLocked deletes entries whose window has ended. Call with mu held.
+// Running this before the map-full check frees slots from expired keys so a
+// full map of stale counters does not spuriously deny or skip new keys.
+func (m *memoryLimiter) sweepExpiredLocked(now time.Time) {
+	for k, e := range m.entries {
+		if now.Sub(e.windowStart) >= e.window {
+			delete(m.entries, k)
+		}
+	}
+}
+
 // Allow increments the fixed-window counter for key. When the key is new and
-// the map is at its MaxEntries cap, the configured WhenMapFull policy applies
-// (permissive allow by default); the outcome is counted in FullAllow/FullDeny
-// so the component can expose http_ratelimiter_map_full_total.
+// the map is at its MaxEntries cap, the configured WhenMapFull policy applies;
+// the outcome is counted in FullAllow/FullDeny so the component can expose
+// http_ratelimiter_map_full_total. Expired entries are swept before the cap
+// check so they do not occupy slots forever.
 func (m *memoryLimiter) Allow(ctx context.Context, key string, limit int64, window time.Duration, cfg MemoryFallbackConfig) (Result, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -45,6 +57,7 @@ func (m *memoryLimiter) Allow(ctx context.Context, key string, limit int64, wind
 		return Result{Allowed: true}, nil
 	}
 	now := time.Now()
+	m.sweepExpiredLocked(now)
 	e, ok := m.entries[key]
 	if !ok {
 		if len(m.entries) >= cfg.MaxEntries {

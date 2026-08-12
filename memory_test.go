@@ -126,6 +126,29 @@ func TestMemoryLimiterMapFullDeny(t *testing.T) {
 	}
 }
 
+func TestMemoryLimiterSweepExpiredBeforeMapFull(t *testing.T) {
+	m := newMemoryLimiter()
+	ctx := context.Background()
+	cfg := MemoryFallbackConfig{MaxEntries: 2, WhenMapFull: MapFullDeny}
+	for i := 0; i < 2; i++ {
+		if _, err := m.Allow(ctx, "k"+strconv.Itoa(i), 10, 50*time.Millisecond, cfg); err != nil {
+			t.Fatalf("Allow: %v", err)
+		}
+	}
+	time.Sleep(80 * time.Millisecond)
+	// Expired keys must be swept so a new key fits without MapFullDeny.
+	res, err := m.Allow(ctx, "fresh", 10, time.Minute, cfg)
+	if err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+	if !res.Allowed {
+		t.Fatal("new key after expiry should be allowed (sweep frees slots)")
+	}
+	if m.FullDeny() != 0 {
+		t.Fatalf("FullDeny = %d, want 0 after sweep", m.FullDeny())
+	}
+}
+
 func TestMemoryLimiterLen(t *testing.T) {
 	m := newMemoryLimiter()
 	ctx := context.Background()

@@ -16,17 +16,49 @@ func (c *RateLimiter) Metrics() []cf_observability.Metric {
 	if !c.metricsEnabledValue() {
 		return nil
 	}
+	c.mu.RLock()
+	inMem := c.useMemoryFallback
+	force := c.forceMemory
+	valkeyLive := c.valkeyLive
+	memoryMode := c.memoryMode
+	c.mu.RUnlock()
+
 	backend := "valkey"
-	if c.memoryBackend {
+	if force || memoryMode {
 		backend = "memory"
 	}
+	lame := force && inMem && valkeyLive
 	labels := map[string]string{"component": c.Name()}
+	bool01 := func(b bool) float64 {
+		if b {
+			return 1
+		}
+		return 0
+	}
 	ms := []cf_observability.Metric{
 		{
 			Name:   "http_ratelimiter_info",
 			Help:   "HTTP rate limiter descriptor; 1 while initialized.",
 			Value:  1,
 			Labels: copyLabels(labels, map[string]string{"backend": backend}),
+		},
+		{
+			Name:   "http_ratelimiter_use_memory_fallback",
+			Help:   "1 when the sticky-note (use_memory_fallback) capability is enabled.",
+			Value:  bool01(inMem),
+			Labels: copyLabels(labels),
+		},
+		{
+			Name:   "http_ratelimiter_force_memory",
+			Help:   "1 when force_memory break-glass sticky-note primary is enabled.",
+			Value:  bool01(force),
+			Labels: copyLabels(labels),
+		},
+		{
+			Name:   "http_ratelimiter_lame_memory_mode",
+			Help:   "1 when force_memory and use_memory_fallback are on while Valkey was healthy at Init (shame metric).",
+			Value:  bool01(lame),
+			Labels: copyLabels(labels),
 		},
 		{
 			Name:   "http_ratelimiter_allows_total",
@@ -95,6 +127,20 @@ func (c *RateLimiter) Metrics() []cf_observability.Metric {
 			Name:   "http_ratelimiter_storage_errors_total",
 			Help:   "Total number of primary store (Valkey) errors.",
 			Value:  float64(c.storageErrors.Load()),
+			Labels: copyLabels(labels),
+			Type:   cf_observability.MetricTypeCounter,
+		},
+		{
+			Name:   "http_ratelimiter_memory_path_total",
+			Help:   "Times Allow used the in-process sticky-note path.",
+			Value:  float64(c.memoryPath.Load()),
+			Labels: copyLabels(labels),
+			Type:   cf_observability.MetricTypeCounter,
+		},
+		{
+			Name:   "http_ratelimiter_missing_ttl_total",
+			Help:   "Times a Valkey counter with count>0 and PTTL<=0 was scrubbed.",
+			Value:  float64(c.missingTTL.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
 		},

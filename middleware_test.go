@@ -13,7 +13,13 @@ import (
 
 func memRL(t *testing.T) *RateLimiter {
 	t.Helper()
-	r := New(WithMemoryBackend(), WithWaitJitterMax(0))
+	r := New(
+		WithoutValkeyPeer(),
+		WithUseMemoryFallback(true),
+		WithMemoryMapFullPolicy("allow"),
+		WithWaitMissingTTLPolicy("proceed"),
+		WithWaitJitterMax(0),
+	)
 	if err := r.Init(context.Background(), cf.New()); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -221,10 +227,28 @@ func TestMiddlewareRetryAfterMatchesWindow(t *testing.T) {
 	}
 }
 
+func TestMiddlewareMemoryFallbackRequiresUseMemoryFallback(t *testing.T) {
+	r := New()
+	pol := StorageMemoryFallback
+	_, err := Middleware(MiddlewareConfig{
+		Limiter:      r,
+		Limit:        2,
+		Window:       time.Minute,
+		KeyFunc:      func(r *http.Request) string { return "k" },
+		OnStoreError: &pol,
+	})
+	if err == nil {
+		t.Fatal("Middleware with MemoryFallback and use_memory_fallback=false should error")
+	}
+	if !strings.Contains(err.Error(), "use_memory_fallback") {
+		t.Fatalf("error = %v, want use_memory_fallback mention", err)
+	}
+}
+
 func TestMiddlewareMemoryFallbackOnStoreError(t *testing.T) {
 	// A valkey-backend limiter with no store (never Init'd): middleware should
 	// fall back to the in-memory map under StorageMemoryFallback.
-	r := New(WithMemoryMaxEntries(100), WithWaitJitterMax(0))
+	r := New(WithMemoryMaxEntries(100), WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"), WithWaitJitterMax(0))
 	pol := StorageMemoryFallback
 	mw, err := Middleware(MiddlewareConfig{
 		Limiter:      r,

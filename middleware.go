@@ -11,7 +11,9 @@ import (
 // Middleware builds a stdlib middleware (func(http.Handler) http.Handler) from
 // cfg. It errors when Limiter, KeyFunc, or OnStoreError are nil, or when
 // Window <= 0. OnStoreError is required: choosing this module means tuning
-// store-error policy — there is no silent FailOpen.
+// store-error policy — there is no silent FailOpen. StorageMemoryFallback
+// requires the limiter's use_memory_fallback capability to be on. MiddlewareConfig.Memory
+// is wired into AllowWithPolicyOpts for per-route sizing overrides.
 //
 // The middleware never sleeps. On denial it answers immediately: 429 with a
 // Retry-After header from Result.ResetIn (or 503 for a FailClosed store error,
@@ -23,6 +25,9 @@ func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
 	if cfg.OnStoreError == nil {
 		return nil, errors.New("cf_http_ratelimiter: Middleware: OnStoreError is required — choosing this module means tuning store-error policy")
 	}
+	if *cfg.OnStoreError == StorageMemoryFallback && !cfg.Limiter.UseMemoryFallback() {
+		return nil, errors.New("cf_http_ratelimiter: Middleware: StorageMemoryFallback requires use_memory_fallback=true on the limiter")
+	}
 	if cfg.KeyFunc == nil {
 		return nil, errors.New("cf_http_ratelimiter: Middleware: KeyFunc is required — use a trusted client identity (e.g. RemoteAddrKey or your mesh's normalized IP), not a client-supplied header")
 	}
@@ -32,7 +37,7 @@ func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := cfg.KeyFunc(r)
-			res, err := cfg.Limiter.AllowWithPolicy(r.Context(), key, cfg.Limit, cfg.Window, *cfg.OnStoreError)
+			res, err := cfg.Limiter.AllowWithPolicyOpts(r.Context(), key, cfg.Limit, cfg.Window, *cfg.OnStoreError, cfg.Memory)
 			if err != nil {
 				// FailClosed store error (or a memory error): the store could
 				// not answer. 503, not 429 — the limiter itself is down.

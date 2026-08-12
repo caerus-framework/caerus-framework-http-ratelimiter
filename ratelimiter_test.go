@@ -2,12 +2,19 @@ package cf_http_ratelimiter
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	cf "github.com/caerus-framework/caerus-framework"
+	cf_configuration "github.com/caerus-framework/caerus-framework-configuration"
+	cf_logs "github.com/caerus-framework/caerus-framework-logs"
 	cf_observability "github.com/caerus-framework/caerus-framework-observability"
 	cf_valkey "github.com/caerus-framework/caerus-framework-valkey"
 )
@@ -55,8 +62,11 @@ func TestNewDefaults(t *testing.T) {
 	if !r.metricsEnabled {
 		t.Fatal("metricsEnabled should default to true")
 	}
-	if r.memoryBackend {
-		t.Fatal("memoryBackend should default to false (valkey is the default backend)")
+	if !r.requireValkey {
+		t.Fatal("requireValkey should default to true")
+	}
+	if r.useMemoryFallback || r.forceMemory {
+		t.Fatal("use_memory_fallback/force_memory should default to false")
 	}
 	if r.HashIPKeys() {
 		t.Fatal("HashIPKeys should default to false")
@@ -72,17 +82,20 @@ func TestNewWithName(t *testing.T) {
 
 func TestWithConfigOverridesOptions(t *testing.T) {
 	on := true
+	inmem := true
 	r := New(
 		WithKeyPrefix("app"),
 		WithMaxKeyLength(100),
 		WithMemoryMaxEntries(50),
 		WithConfig(Config{
-			KeyPrefix:           "cfg",
-			MaxKeyLength:        200,
-			MemoryMaxEntries:    80,
-			MetricsEnabled:      &on,
-			MemoryMapFullPolicy: "deny",
-			WaitJitterMaxSec:    ptrFloat(0),
+			KeyPrefix:            "cfg",
+			MaxKeyLength:         200,
+			MemoryMaxEntries:     80,
+			MetricsEnabled:       &on,
+			UseMemoryFallback:    &inmem,
+			MemoryMapFullPolicy:  "deny",
+			WaitMissingTTLPolicy: "proceed",
+			WaitJitterMaxSec:     ptrFloat(0),
 		}),
 	)
 	if r.keyPrefix != "cfg" {
@@ -97,8 +110,14 @@ func TestWithConfigOverridesOptions(t *testing.T) {
 	if !r.metricsEnabled {
 		t.Fatal("metricsEnabled should be true from config")
 	}
-	if r.mapFullPolicy != MapFullDeny {
-		t.Fatalf("mapFullPolicy = %v, want MapFullDeny", r.mapFullPolicy)
+	if !r.useMemoryFallback {
+		t.Fatal("useMemoryFallback should be true from config")
+	}
+	if r.mapFullPolicy != MapFullDeny || !r.mapFullPolicySet {
+		t.Fatalf("mapFullPolicy = %v set=%v, want MapFullDeny set", r.mapFullPolicy, r.mapFullPolicySet)
+	}
+	if r.waitMissingTTLPolicy != MissingTTLProceed || !r.waitMissingTTLPolicyOK {
+		t.Fatalf("waitMissingTTLPolicy = %v ok=%v", r.waitMissingTTLPolicy, r.waitMissingTTLPolicyOK)
 	}
 	if r.waitJitterMax != 0 {
 		t.Fatalf("waitJitterMax = %v, want 0", r.waitJitterMax)
@@ -135,15 +154,26 @@ func TestGetDependencies(t *testing.T) {
 		t.Fatalf("GetDependencies() with source = %v, want [valkey logs configuration]", deps)
 	}
 
-	mem := New(WithMemoryBackend())
+	mem := New(WithoutValkeyPeer(), WithUseMemoryFallback(true))
 	deps = mem.GetDependencies()
 	if len(deps) != 1 || deps[0] != "logs" {
-		t.Fatalf("memory-backend GetDependencies() = %v, want [logs]", deps)
+		t.Fatalf("WithoutValkeyPeer GetDependencies() = %v, want [logs]", deps)
+	}
+}
+
+func TestInitRequiresWaitMissingTTLPolicy(t *testing.T) {
+	r := New()
+	err := r.Init(context.Background(), cf.New())
+	if err == nil {
+		t.Fatal("Init without wait_missing_ttl_policy should fail")
+	}
+	if !strings.Contains(err.Error(), "wait_missing_ttl_policy") {
+		t.Fatalf("Init error = %v, want wait_missing_ttl_policy", err)
 	}
 }
 
 func TestInitRequiresValkey(t *testing.T) {
-	r := New()
+	r := New(WithWaitMissingTTLPolicy("proceed"))
 	err := r.Init(context.Background(), cf.New())
 	if err == nil {
 		t.Fatal("Init without a valkey component should fail")
@@ -154,7 +184,7 @@ func TestInitRequiresValkey(t *testing.T) {
 }
 
 func TestInitWithNamedValkeyMissing(t *testing.T) {
-	r := New(WithValkeyName("cache"))
+	r := New(WithValkeyName("cache"), WithWaitMissingTTLPolicy("error"))
 	err := r.Init(context.Background(), cf.New())
 	if err == nil {
 		t.Fatal("Init with a missing named valkey should fail")
@@ -169,7 +199,7 @@ func TestInitRequiresValkeyInitialized(t *testing.T) {
 	if err := fw.AddComponent(cf_valkey.New()); err != nil {
 		t.Fatalf("AddComponent: %v", err)
 	}
-	r := New()
+	r := New(WithWaitMissingTTLPolicy("proceed"))
 	err := r.Init(context.Background(), fw)
 	if err == nil {
 		t.Fatal("Init against an uninitialized valkey should fail")
@@ -179,10 +209,10 @@ func TestInitRequiresValkeyInitialized(t *testing.T) {
 	}
 }
 
-func TestInitMemoryBackendSucceedsWithoutValkey(t *testing.T) {
-	r := New(WithMemoryBackend())
+func TestInitMemoryOnlySucceedsWithoutValkey(t *testing.T) {
+	r := New(memoryOnlyOpts()...)
 	if err := r.Init(context.Background(), cf.New()); err != nil {
-		t.Fatalf("memory-backend Init: %v", err)
+		t.Fatalf("memory-only Init: %v", err)
 	}
 	if err := r.Health(context.Background()); err != nil {
 		t.Fatalf("Health after memory Init: %v", err)
@@ -201,8 +231,30 @@ func TestInitMemoryBackendSucceedsWithoutValkey(t *testing.T) {
 	}
 }
 
+func TestInitWithoutValkeyRequiresUseMemoryFallback(t *testing.T) {
+	r := New(WithoutValkeyPeer(), WithWaitMissingTTLPolicy("proceed"))
+	err := r.Init(context.Background(), cf.New())
+	if err == nil {
+		t.Fatal("WithoutValkeyPeer without use_memory_fallback should fail Init")
+	}
+	if !strings.Contains(err.Error(), "use_memory_fallback") {
+		t.Fatalf("Init error = %v, want use_memory_fallback mention", err)
+	}
+}
+
+func TestInitUseMemoryFallbackRequiresMapFullPolicy(t *testing.T) {
+	r := New(WithoutValkeyPeer(), WithUseMemoryFallback(true), WithWaitMissingTTLPolicy("proceed"))
+	err := r.Init(context.Background(), cf.New())
+	if err == nil {
+		t.Fatal("use_memory_fallback without memory_map_full_policy should fail Init")
+	}
+	if !strings.Contains(err.Error(), "memory_map_full_policy") {
+		t.Fatalf("Init error = %v, want memory_map_full_policy", err)
+	}
+}
+
 func TestMetricsDisabledReturnsNil(t *testing.T) {
-	r := New(WithMemoryBackend(), WithMetricsEnabled(false))
+	r := New(append(memoryOnlyOpts(), WithMetricsEnabled(false))...)
 	if err := r.Init(context.Background(), cf.New()); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -211,9 +263,27 @@ func TestMetricsDisabledReturnsNil(t *testing.T) {
 	}
 }
 
+func memoryOnlyOpts() []Option {
+	return []Option{
+		WithoutValkeyPeer(),
+		WithUseMemoryFallback(true),
+		WithMemoryMapFullPolicy("allow"),
+		WithWaitMissingTTLPolicy("proceed"),
+	}
+}
+
+func testFW(t *testing.T) *cf.CaerusFramework {
+	t.Helper()
+	fw := cf.New()
+	if err := fw.AddComponent(cf_logs.New(cf_logs.WithWriter(io.Discard))); err != nil {
+		t.Fatalf("AddComponent logs: %v", err)
+	}
+	return fw
+}
+
 func newMemoryRL(t *testing.T, opts ...Option) *RateLimiter {
 	t.Helper()
-	all := append([]Option{WithMemoryBackend()}, opts...)
+	all := append(memoryOnlyOpts(), opts...)
 	r := New(all...)
 	if err := r.Init(context.Background(), cf.New()); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -512,7 +582,7 @@ func TestAllowWithPolicyFailClosedOnStoreError(t *testing.T) {
 }
 
 func TestAllowWithPolicyMemoryFallbackOnStoreError(t *testing.T) {
-	r := New(WithMemoryMaxEntries(100))
+	r := New(WithMemoryMaxEntries(100), WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"))
 	res, err := r.AllowWithPolicy(context.Background(), "k", 2, time.Minute, StorageMemoryFallback)
 	if err != nil {
 		t.Fatalf("MemoryFallback should not error: %v", err)
@@ -536,17 +606,51 @@ func TestAllowWithPolicyMemoryFallbackOnStoreError(t *testing.T) {
 	}
 }
 
+func TestAllowWithPolicyMemoryFallbackRequiresUseMemoryFallback(t *testing.T) {
+	r := New()
+	_, err := r.AllowWithPolicy(context.Background(), "k", 2, time.Minute, StorageMemoryFallback)
+	if !errors.Is(err, ErrMemoryFallbackDisabled) {
+		t.Fatalf("error = %v, want ErrMemoryFallbackDisabled", err)
+	}
+}
+
+func TestAllowWithPolicyOptsMemoryOverride(t *testing.T) {
+	r := New(WithMemoryMaxEntries(100), WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"))
+	// Coarser fallback limit of 1: second call denied.
+	res, err := r.AllowWithPolicyOpts(context.Background(), "k", 10, time.Minute, StorageMemoryFallback, MemoryFallbackConfig{
+		Limit: 1,
+	})
+	if err != nil {
+		t.Fatalf("AllowWithPolicyOpts: %v", err)
+	}
+	if !res.Allowed {
+		t.Fatal("first call should allow")
+	}
+	res, err = r.AllowWithPolicyOpts(context.Background(), "k", 10, time.Minute, StorageMemoryFallback, MemoryFallbackConfig{
+		Limit: 1,
+	})
+	if err != nil {
+		t.Fatalf("AllowWithPolicyOpts: %v", err)
+	}
+	if res.Allowed {
+		t.Fatal("second call should deny under override Limit=1")
+	}
+}
+
 func TestOnConfigReloadAppliesTunables(t *testing.T) {
-	r := New(WithMemoryBackend(), WithConfigSource("http-ratelimiter", "config/http-ratelimiter.json"))
+	r := New(append(memoryOnlyOpts(), WithConfigSource("http-ratelimiter", "config/http-ratelimiter.json"))...)
 	r.initialized.Store(true)
 	on := true
+	inmem := true
 	r.OnConfigReload("http-ratelimiter", &Config{
-		KeyPrefix:           "cfg",
-		MaxKeyLength:        128,
-		MemoryMaxEntries:    42,
-		MemoryMapFullPolicy: "deny",
-		MetricsEnabled:      &on,
-		WaitJitterMaxSec:    ptrFloat(2),
+		KeyPrefix:            "cfg",
+		MaxKeyLength:         128,
+		MemoryMaxEntries:     42,
+		UseMemoryFallback:    &inmem,
+		MemoryMapFullPolicy:  "deny",
+		WaitMissingTTLPolicy: "error",
+		MetricsEnabled:       &on,
+		WaitJitterMaxSec:     ptrFloat(2),
 	})
 	if r.keyPrefix != "cfg" {
 		t.Fatalf("keyPrefix = %q, want cfg", r.keyPrefix)
@@ -559,6 +663,9 @@ func TestOnConfigReloadAppliesTunables(t *testing.T) {
 	}
 	if r.mapFullPolicy != MapFullDeny {
 		t.Fatalf("mapFullPolicy = %v, want MapFullDeny", r.mapFullPolicy)
+	}
+	if r.waitMissingTTLPolicy != MissingTTLError {
+		t.Fatalf("waitMissingTTLPolicy = %v, want error", r.waitMissingTTLPolicy)
 	}
 	if r.waitJitterMax != 2*time.Second {
 		t.Fatalf("waitJitterMax = %v, want 2s", r.waitJitterMax)
@@ -574,11 +681,28 @@ func TestOnConfigReloadAppliesTunables(t *testing.T) {
 	}
 }
 
-func TestUnknownMapFullPolicyDefaultsAllow(t *testing.T) {
+func TestOnConfigReloadRejectsInvalidPolicy(t *testing.T) {
+	r := New(memoryOnlyOpts()...)
+	r.configSource = "http-ratelimiter"
+	r.initialized.Store(true)
+	r.OnConfigReload("http-ratelimiter", &Config{
+		WaitMissingTTLPolicy: "banana",
+		UseMemoryFallback:    ptrBool(true),
+		MemoryMapFullPolicy:  "allow",
+	})
+	if r.waitMissingTTLPolicy != MissingTTLProceed {
+		t.Fatalf("invalid reload should keep last-good proceed, got %v", r.waitMissingTTLPolicy)
+	}
+	if r.reloads.Load() != 0 {
+		t.Fatalf("rejected reload should not increment reloads")
+	}
+}
+
+func TestUnknownMapFullPolicyNotSet(t *testing.T) {
 	r := New()
 	r.applyConfig(Config{MemoryMapFullPolicy: "banana"})
-	if r.mapFullPolicy != MapFullAllow {
-		t.Fatalf("mapFullPolicy = %v, want MapFullAllow for unknown value", r.mapFullPolicy)
+	if r.mapFullPolicySet {
+		t.Fatal("unknown memory_map_full_policy must not mark policy as set")
 	}
 }
 
@@ -649,4 +773,302 @@ func TestMetricsCatalogue(t *testing.T) {
 	}
 }
 
+func TestOptionConstructorsApply(t *testing.T) {
+	delay := func(context.Context, string, time.Duration, time.Duration) (time.Duration, error) {
+		return time.Millisecond, nil
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	r := New(
+		WithLogger(logger),
+		WithForceMemory(true),
+		WithUseMemoryFallback(true),
+		WithWaitDelayFunc(delay),
+		WithConfigSource("http-ratelimiter", "config/rl.yaml",
+			WithSourceEnvPrefix("RL_"),
+			WithSourceFormat(cf_configuration.FormatYAML),
+		),
+		WithoutValkeyPeer(),
+		WithMemoryMapFullPolicy("allow"),
+		WithWaitMissingTTLPolicy("proceed"),
+	)
+	if !r.loggerSet || r.logger == nil {
+		t.Fatal("WithLogger should set loggerSet")
+	}
+	if !r.ForceMemory() || !r.UseMemoryFallback() {
+		t.Fatal("force_memory / use_memory_fallback options not applied")
+	}
+	if r.waitDelayFunc == nil {
+		t.Fatal("WithWaitDelayFunc should set waitDelayFunc")
+	}
+	if r.configSource != "http-ratelimiter" || r.configPath != "config/rl.yaml" {
+		t.Fatalf("config source = %q path %q", r.configSource, r.configPath)
+	}
+	if r.srcEnvPrefix != "RL_" || !r.srcFormatSet || r.srcFormat != cf_configuration.FormatYAML {
+		t.Fatalf("source options: prefix=%q formatSet=%v format=%v", r.srcEnvPrefix, r.srcFormatSet, r.srcFormat)
+	}
+}
+
+func TestWaitDelayAndMemoryMaxEntriesHelpers(t *testing.T) {
+	r := newMemoryRL(t, WithWaitJitterMax(0), WithMemoryMaxEntries(42))
+	if got := r.memoryMaxEntriesValue(); got != 42 {
+		t.Fatalf("memoryMaxEntriesValue = %d, want 42", got)
+	}
+	r.memoryMaxEntries = 0
+	if got := r.memoryMaxEntriesValue(); got != defaultMemoryMaxEntries {
+		t.Fatalf("memoryMaxEntriesValue default = %d, want %d", got, defaultMemoryMaxEntries)
+	}
+
+	d, err := r.waitDelay(context.Background(), "k", 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("waitDelay: %v", err)
+	}
+	if d != 50*time.Millisecond {
+		t.Fatalf("waitDelay with jitterMax=0 = %v, want 50ms", d)
+	}
+
+	r2 := newMemoryRL(t, WithWaitJitterMax(time.Second))
+	d2, err := r2.waitDelay(context.Background(), "k", time.Second)
+	if err != nil {
+		t.Fatalf("waitDelay jittered: %v", err)
+	}
+	if d2 < time.Second || d2 > time.Second+100*time.Millisecond {
+		t.Fatalf("waitDelay jittered = %v, want in [1s, 1.1s]", d2)
+	}
+
+	called := false
+	d3, err := r2.waitDelayOpts(context.Background(), "k", time.Second, WaitOptions{
+		DelayFunc: func(ctx context.Context, key string, base, jittered time.Duration) (time.Duration, error) {
+			called = true
+			return 5 * time.Millisecond, nil
+		},
+	})
+	if err != nil || !called || d3 != 5*time.Millisecond {
+		t.Fatalf("waitDelayOpts DelayFunc: called=%v d=%v err=%v", called, d3, err)
+	}
+}
+
+func TestRegisterConfigSources(t *testing.T) {
+	r := New()
+	if err := r.RegisterConfigSources(cf_configuration.New()); err != nil {
+		t.Fatalf("no source bound should be no-op: %v", err)
+	}
+	if err := r.RegisterConfigSources("not-config"); err == nil {
+		t.Fatal("wrong type should error")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rl.json")
+	if err := os.WriteFile(path, []byte(`{"key_prefix":"fromreg"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r = New(WithConfigSource("http-ratelimiter", path))
+	conf := cf_configuration.New()
+	if err := r.RegisterConfigSources(conf); err != nil {
+		t.Fatalf("RegisterConfigSources: %v", err)
+	}
+	yamlPath := filepath.Join(dir, "rl.yaml")
+	if err := os.WriteFile(yamlPath, []byte("key_prefix: yamlpref\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rYAML := New(WithConfigSource("rl-yaml", yamlPath))
+	if err := rYAML.RegisterConfigSources(cf_configuration.New()); err != nil {
+		t.Fatalf("RegisterConfigSources yaml: %v", err)
+	}
+}
+
+func TestHealthMemoryPathAndClientErrors(t *testing.T) {
+	r := newMemoryRL(t)
+	if err := r.Health(context.Background()); err != nil {
+		t.Fatalf("memory-path Health should be nil: %v", err)
+	}
+	if _, err := r.client(); err == nil {
+		t.Fatal("client() on memory-only chassis should error (no valkey peer)")
+	}
+	_ = r.Shutdown(context.Background())
+	if err := r.Health(context.Background()); err == nil {
+		t.Fatal("Health after Shutdown should fail")
+	}
+	if _, err := r.Peek(context.Background(), "k"); err == nil {
+		t.Fatal("Peek after Shutdown should fail")
+	}
+	if err := r.Reset(context.Background(), "k"); err == nil {
+		t.Fatal("Reset after Shutdown should fail")
+	}
+}
+
+func TestForceMemoryInitWithDegradedValkey(t *testing.T) {
+	fw := testFW(t)
+	vk := cf_valkey.New(
+		cf_valkey.WithAddress("127.0.0.1:1"),
+		cf_valkey.WithPingTimeout(200*time.Millisecond),
+		cf_valkey.WithDegradedMode(true),
+		cf_valkey.WithHealthWhenDegraded("not_ready"),
+	)
+	if err := fw.AddComponent(vk); err != nil {
+		t.Fatalf("AddComponent valkey: %v", err)
+	}
+	r := New(
+		WithForceMemory(true),
+		WithUseMemoryFallback(true),
+		WithMemoryMapFullPolicy("allow"),
+		WithWaitMissingTTLPolicy("proceed"),
+	)
+	if err := fw.AddComponent(r); err != nil {
+		t.Fatalf("AddComponent limiter: %v", err)
+	}
+	if err := fw.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	t.Cleanup(func() { _ = fw.Shutdown(context.Background()) })
+
+	if !r.useMemoryPath() {
+		t.Fatal("force_memory + dead valkey should use memory path")
+	}
+	if err := r.Health(context.Background()); err != nil {
+		t.Fatalf("limiter Health on sticky path: %v", err)
+	}
+	res, err := r.Allow(context.Background(), "breakglass", 2, time.Minute)
+	if err != nil || !res.Allowed {
+		t.Fatalf("Allow on sticky path: res=%+v err=%v", res, err)
+	}
+	var force, inmem float64
+	for _, m := range r.Metrics() {
+		switch m.Name {
+		case "http_ratelimiter_force_memory":
+			force = m.Value
+		case "http_ratelimiter_use_memory_fallback":
+			inmem = m.Value
+		}
+	}
+	if force != 1 || inmem != 1 {
+		t.Fatalf("force_memory=%v use_memory_fallback=%v, want 1/1", force, inmem)
+	}
+}
+
+func TestInitLoadsConfigFromSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "http-ratelimiter.json")
+	body := `{
+  "key_prefix": "fromfile",
+  "use_memory_fallback": true,
+  "force_memory": false,
+  "memory_map_full_policy": "deny",
+  "wait_missing_ttl_policy": "error",
+  "memory_max_entries": 77,
+  "max_key_length": 120
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fw := testFW(t)
+	if err := fw.AddComponent(cf_configuration.New()); err != nil {
+		t.Fatalf("AddComponent configuration: %v", err)
+	}
+	r := New(
+		WithoutValkeyPeer(),
+		WithConfigSource("http-ratelimiter", path),
+		WithUseMemoryFallback(true),
+		WithMemoryMapFullPolicy("allow"),
+		WithWaitMissingTTLPolicy("proceed"),
+	)
+	if err := fw.AddComponent(r); err != nil {
+		t.Fatalf("AddComponent: %v", err)
+	}
+	if err := fw.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	t.Cleanup(func() { _ = fw.Shutdown(context.Background()) })
+
+	if r.keyPrefix != "fromfile" {
+		t.Fatalf("keyPrefix = %q, want fromfile (applyConfigFromSource)", r.keyPrefix)
+	}
+	if r.memoryMaxEntries != 77 {
+		t.Fatalf("memoryMaxEntries = %d, want 77", r.memoryMaxEntries)
+	}
+	if r.mapFullPolicy != MapFullDeny {
+		t.Fatalf("mapFullPolicy = %v, want deny from file", r.mapFullPolicy)
+	}
+	if r.waitMissingTTLPolicy != MissingTTLError {
+		t.Fatalf("waitMissingTTLPolicy = %v, want error from file", r.waitMissingTTLPolicy)
+	}
+}
+
+func TestInitConfigSourceMissingConfiguration(t *testing.T) {
+	r := New(
+		WithoutValkeyPeer(),
+		WithUseMemoryFallback(true),
+		WithMemoryMapFullPolicy("allow"),
+		WithWaitMissingTTLPolicy("proceed"),
+		WithConfigSource("http-ratelimiter", "nope.json"),
+	)
+	fw := cf.New()
+	if err := r.Init(context.Background(), fw); err == nil {
+		t.Fatal("Init with unbound config source should fail")
+	}
+}
+
+func TestOnConfigReloadForceMemoryFlip(t *testing.T) {
+	r := newMemoryRL(t)
+	r.configSource = "http-ratelimiter"
+	on := true
+	force := true
+	r.OnConfigReload("http-ratelimiter", &Config{
+		UseMemoryFallback:    &on,
+		ForceMemory:          &force,
+		MemoryMapFullPolicy:  "allow",
+		WaitMissingTTLPolicy: "proceed",
+	})
+	if !r.ForceMemory() {
+		t.Fatal("reload should enable force_memory")
+	}
+	if !r.useMemoryPath() {
+		t.Fatal("force_memory reload should keep/prefer memory path")
+	}
+}
+
+func TestWaitOptsPerCallDelayFunc(t *testing.T) {
+	r := newMemoryRL(t, WithWaitJitterMax(0))
+	if _, err := r.Allow(context.Background(), "k", 1, time.Hour); err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+	err := r.WaitOpts(context.Background(), "k", 1, time.Hour, WaitOptions{
+		DelayFunc: func(context.Context, string, time.Duration, time.Duration) (time.Duration, error) {
+			return 0, context.Canceled
+		},
+	})
+	if err != context.Canceled {
+		t.Fatalf("WaitOpts = %v, want context.Canceled from DelayFunc", err)
+	}
+}
+
+func TestPeekMemoryPathAndDoubleInit(t *testing.T) {
+	r := newMemoryRL(t)
+	ctx := context.Background()
+	if _, err := r.Allow(ctx, "p", 5, time.Minute); err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+	res, err := r.Peek(ctx, "p")
+	if err != nil || res.Count != 1 {
+		t.Fatalf("Peek = %+v err=%v, want count 1", res, err)
+	}
+	if err := r.Init(ctx, cf.New()); err != nil {
+		t.Fatalf("second Init: %v", err)
+	}
+}
+
+func TestInitIdempotentAlreadyInitialized(t *testing.T) {
+	r := New(memoryOnlyOpts()...)
+	fw := cf.New()
+	if err := r.Init(context.Background(), fw); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := r.Init(context.Background(), fw); err != nil {
+		t.Fatalf("re-Init: %v", err)
+	}
+	_ = r.Shutdown(context.Background())
+}
+
 func ptrFloat(f float64) *float64 { return &f }
+
+func ptrBool(b bool) *bool { return &b }

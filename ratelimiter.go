@@ -42,7 +42,7 @@ const (
 	ComponentStage = cf.Stage("data")
 )
 
-// Defaults for module knobs. Limits and windows are caller-supplied per call;
+// Defaults for module settings. Limits and windows are caller-supplied per call;
 // these are module-level tunables only.
 const (
 	// defaultKeyPrefix is the logical prefix the component puts between the
@@ -55,8 +55,7 @@ const (
 	defaultMaxKeyLength = 256
 
 	// defaultMemoryMaxEntries is the hard cap on distinct keys in the
-	// in-process map (the unlocked memory backend and the memory-fallback
-	// policy share one map).
+	// in-process map (force_memory / use_memory_fallback / MemoryFallback share one map).
 	defaultMemoryMaxEntries = 10000
 
 	// defaultWaitJitterMax caps the random extra sleep Wait adds to ResetIn.
@@ -87,6 +86,15 @@ end
 return {tonumber(c), t}`
 )
 
+// ErrMissingTTL is returned when a Valkey counter exists with count > 0 but no
+// usable TTL (PTTL <= 0), after the key was scrubbed, and wait_missing_ttl_policy
+// (or a WaitOptions override) is "error".
+var ErrMissingTTL = errors.New("cf_http_ratelimiter: counter missing TTL")
+
+// ErrMemoryFallbackDisabled is returned when a call site asks for
+// StorageMemoryFallback but the component's use_memory_fallback capability is off.
+var ErrMemoryFallbackDisabled = errors.New("cf_http_ratelimiter: StorageMemoryFallback requires use_memory_fallback=true")
+
 // Result reports the outcome of an Allow or Peek call.
 type Result struct {
 	// Allowed is true when Count does not exceed the limit for the window.
@@ -115,28 +123,43 @@ const (
 	// webhook intake where failing open would feed an attacker.
 	StorageFailClosed
 	// StorageMemoryFallback uses the process-local memory limiter for that
-	// call. Still some limits, only on this one server. Typical for login
-	// lockout where a coarse in-process ceiling is better than none.
+	// call. Still some limits, only on this one server. Requires use_memory_fallback=true
+	// on the component. Typical for login lockout where a coarse in-process
+	// ceiling is better than none.
 	StorageMemoryFallback
 )
 
 // MapFullPolicy is the "fallback/memory map hit its max distinct keys" policy.
-// Unlike OnStoreError, an unset map-full policy is permissive: it allows the
-// call rather than denying it.
+// On MemoryFallbackConfig, the zero value (MapFullAllow) means "inherit the
+// component's required memory_map_full_policy". After resolve, MapFullAllow
+// allows the call without counting and MapFullDeny rejects it.
 type MapFullPolicy int
 
 const (
-	// MapFullAllow is the default when unset (permissive). The call is
-	// allowed without counting.
+	// MapFullAllow allows a new key without counting when the map is full.
+	// On MemoryFallbackConfig, the zero value also means "inherit component".
 	MapFullAllow MapFullPolicy = iota
 	// MapFullDeny rejects Allow for a new key when the cap is reached.
 	MapFullDeny
 )
 
+// MissingTTLPolicy selects what happens after scrubbing a counter that has
+// count > 0 but no usable TTL. It must be set explicitly on the component
+// (wait_missing_ttl_policy); WaitOptions may override per call.
+type MissingTTLPolicy int
+
+const (
+	// MissingTTLProceed continues after delete: Allow re-runs once; Wait does
+	// not sleep and proceeds to Allow once; Peek returns an empty Result.
+	MissingTTLProceed MissingTTLPolicy = iota + 1
+	// MissingTTLError returns ErrMissingTTL after delete.
+	MissingTTLError
+)
+
 // MemoryFallbackConfig sizes the in-process memory limiter used by the
-// StorageMemoryFallback policy and (with MemoryMaxEntries as the cap) by the
-// unlocked memory backend. Zero fields fall back to the component's configured
-// values; when those are also zero, the call's own limit/window are used.
+// StorageMemoryFallback policy and by force_memory / memory-only mode. Zero
+// fields fall back to the component's configured values; when those are also
+// zero, the call's own limit/window are used.
 type MemoryFallbackConfig struct {
 	// MaxEntries is a hard cap on distinct keys. 0 uses the component's
 	// configured memory_max_entries.
@@ -158,14 +181,20 @@ type MemoryFallbackConfig struct {
 // jitter (if enabled). Return the duration to sleep (may be 0), or an error to
 // abort Wait. A nil function sleeps jittered (or base when jitter is disabled)
 // with ctx.
-//
-// Example app policies:
-//
-//	sleep(jittered)                        // default if nil
-//	sleep(base) only                       // ignore jitter
-//	return 0, errBudgetExceeded            // fail fast instead of waiting
-//	sleep(min(jittered, 5*time.Second))    // cap wait for UX/SLA
 type WaitDelayFunc func(ctx context.Context, key string, base, jittered time.Duration) (sleep time.Duration, err error)
+
+// WaitOptions overrides Wait behaviour for a single call. Nil pointer fields
+// inherit the component defaults.
+type WaitOptions struct {
+	// MissingTTLPolicy overrides wait_missing_ttl_policy when non-nil.
+	MissingTTLPolicy *MissingTTLPolicy
+	// DelayFunc overrides the component WaitDelayFunc when non-nil. A non-nil
+	// function that is itself nil-valued is not expressible; omit to inherit.
+	DelayFunc WaitDelayFunc
+	// delayFuncSet is true when DelayFunc was intentionally provided (including
+	// a nil func to force the built-in jitter path). Set by WaitOpts helpers.
+	delayFuncSet bool
+}
 
 // MiddlewareConfig configures the stdlib Middleware. OnStoreError is required
 // (use a pointer so zero does not silently mean FailOpen); Middleware errors
@@ -185,6 +214,7 @@ type MiddlewareConfig struct {
 	// OnStoreError is the storage-error policy. Required.
 	OnStoreError *StorageErrorPolicy
 	// Memory sizes the memory fallback when OnStoreError == StorageMemoryFallback.
+	// Wired into AllowWithPolicyOpts so per-route overrides apply.
 	Memory MemoryFallbackConfig
 	// OnDenied, when set, is called instead of the default 429/503 response.
 	// status is http.StatusTooManyRequests for an over-limit denial, or
@@ -193,7 +223,7 @@ type MiddlewareConfig struct {
 	OnDenied func(w http.ResponseWriter, r *http.Request, res Result, status int)
 }
 
-// Config is the file/env-drivable module configuration. It holds module knobs
+// Config is the file/env-drivable module configuration. It holds module settings
 // (key prefix, metrics, memory sizing, max key length, wait jitter) — not the
 // per-call limits and windows, which stay caller-supplied (auth / gh-app keep
 // their own policy on their own config sources).
@@ -205,8 +235,17 @@ type Config struct {
 	// MetricsEnabled — pointer so "omitted" (default on) and an explicit false
 	// are distinct. When false, Metrics() returns nil.
 	MetricsEnabled *bool `json:"metrics_enabled,omitempty" yaml:"metrics_enabled,omitempty" env:"METRICS_ENABLED"`
-	// MemoryMaxEntries caps distinct keys in the in-process map (shared by the
-	// unlocked memory backend and the memory-fallback policy). Default 10000.
+	// UseMemoryFallback enables the sticky-note (in-process map) engine. Off → never
+	// count in-process (MemoryFallback is illegal). Required true when the
+	// process omits a valkey peer (WithoutValkeyPeer).
+	UseMemoryFallback *bool `json:"use_memory_fallback,omitempty" yaml:"use_memory_fallback,omitempty" env:"USE_MEMORY_FALLBACK"`
+	// ForceMemory is break-glass: use sticky notes even when Valkey is missing
+	// a live client at Init, and prefer the memory path at runtime while set.
+	// Pair with DegradedMode on the valkey component when Valkey is wired but
+	// may be down at start. When both ForceMemory and UseMemoryFallback are on and
+	// Valkey is healthy, lame_memory_mode screams.
+	ForceMemory *bool `json:"force_memory,omitempty" yaml:"force_memory,omitempty" env:"FORCE_MEMORY"`
+	// MemoryMaxEntries caps distinct keys in the in-process map. Default 10000.
 	MemoryMaxEntries int `json:"memory_max_entries,omitempty" yaml:"memory_max_entries,omitempty" env:"MEMORY_MAX_ENTRIES"`
 	// MemoryFallbackLimit is the optional coarser limit used when a call site
 	// chooses StorageMemoryFallback. 0 → the call's own limit.
@@ -214,10 +253,14 @@ type Config struct {
 	// MemoryFallbackWindowSec is the optional coarser window (seconds) used
 	// when a call site chooses StorageMemoryFallback. 0 → the call's own window.
 	MemoryFallbackWindowSec float64 `json:"memory_fallback_window_sec,omitempty" yaml:"memory_fallback_window_sec,omitempty" env:"MEMORY_FALLBACK_WINDOW_SEC"`
-	// MemoryMapFullPolicy: "" / "allow" → allow new keys when the map is full
-	// (permissive default); "deny" → reject them. Any other value warns and
-	// falls back to allow.
+	// MemoryMapFullPolicy must be "allow" or "deny" whenever use_memory_fallback or
+	// force_memory is true (Init/reload fails otherwise). When both are false
+	// the field may be empty (map unused).
 	MemoryMapFullPolicy string `json:"memory_map_full_policy,omitempty" yaml:"memory_map_full_policy,omitempty" env:"MEMORY_MAP_FULL_POLICY"`
+	// WaitMissingTTLPolicy must be "proceed" or "error" at Init. After scrubbing
+	// a counter with count > 0 and no TTL: proceed continues (Allow once /
+	// empty Peek); error returns ErrMissingTTL.
+	WaitMissingTTLPolicy string `json:"wait_missing_ttl_policy,omitempty" yaml:"wait_missing_ttl_policy,omitempty" env:"WAIT_MISSING_TTL_POLICY"`
 	// HashIPKeys is a documented toggle for apps: when true, apps should HMAC
 	// IPs in their KeyFunc (the KeyHasher helper is provided). The component
 	// exposes it via HashIPKeys(); it does not rewrite keys itself, because the
@@ -249,14 +292,19 @@ type options struct {
 	logger       *slog.Logger
 	loggerSet    bool // true when WithLogger was called explicitly
 
-	memoryBackend    bool // WithMemoryBackend unlock; no valkey peer required
-	keyPrefix        string
-	maxKeyLength     int
-	memoryMaxEntries int
-	metricsEnabled   bool
-	hashIPKeys       bool
-	waitJitterMax    time.Duration
-	waitDelayFunc    WaitDelayFunc
+	requireValkey     bool // false when WithoutValkeyPeer; default true
+	useMemoryFallback *bool
+	forceMemory       *bool
+
+	keyPrefix            string
+	maxKeyLength         int
+	memoryMaxEntries     int
+	memoryMapFullPolicy  string
+	waitMissingTTLPolicy string
+	metricsEnabled       bool
+	hashIPKeys           bool
+	waitJitterMax        time.Duration
+	waitDelayFunc        WaitDelayFunc
 }
 
 // SourceOption configures the self-registered configuration source created by
@@ -296,16 +344,8 @@ func WithConfig(cfg Config) Option {
 
 // WithConfigSource binds this component to a named configuration source and
 // registers that source with the configuration component (via the framework's
-// ConfigSourceRegistrar pass during argv absorption). The module owns the
-// Source: the config type, the default EnvPrefix and its Owner (Name(), so
-// named instances reload correctly). main only points the instance at where
-// the config lives.
-//
-//	cf_http_ratelimiter.New(cf_http_ratelimiter.WithConfigSource("http-ratelimiter", "config/http-ratelimiter.json"))
-//
-// A path of "" registers an env-only (fileless) source when the EnvPrefix is
-// non-empty. The path CLI override stays --<source-name> (ParseFlags).
-// Declares a dependency on "configuration".
+// ConfigSourceRegistrar pass during argv absorption). Declares a dependency
+// on "configuration".
 func WithConfigSource(name, path string, opts ...SourceOption) Option {
 	return func(o *options) {
 		so := sourceOptions{envPrefix: defaultSourceEnvPrefix(name)}
@@ -357,20 +397,46 @@ func WithMaxKeyLength(n int) Option {
 	return func(o *options) { o.maxKeyLength = n }
 }
 
-// WithMemoryBackend unlocks the in-process memory backend. It is disabled by
-// default: without this option the component expects a valkey peer at Init and
-// fails if it is missing. Unlock memory only for unit tests and local
-// CLI/one-off binaries — not for multi-replica production. Config file/env
-// alone cannot switch a process to memory-only.
-func WithMemoryBackend() Option {
-	return func(o *options) { o.memoryBackend = true }
+// WithUseMemoryFallback enables or disables the sticky-note engine (use_memory_fallback). This is
+// the capability flag: MemoryFallback and memory-only chassis need it on.
+// It does not remove the valkey dependency — use WithoutValkeyPeer when the
+// process omits valkey from the framework graph.
+func WithUseMemoryFallback(enabled bool) Option {
+	return func(o *options) { o.useMemoryFallback = &enabled }
+}
+
+// WithForceMemory enables or disables break-glass sticky-note primary
+// (force_memory). When Valkey is wired but Client() is nil at Init, this must
+// be true or Init fails. At runtime, force_memory prefers the memory path.
+func WithForceMemory(enabled bool) Option {
+	return func(o *options) { o.forceMemory = &enabled }
+}
+
+// WithoutValkeyPeer omits valkey from GetDependencies. Use when the process
+// has no valkey component (laptop / single-replica sticky-note chassis). Init
+// then requires use_memory_fallback=true. Wrong: omit valkey from Components but leave
+// the default dependency — Validate fails. Right: WithoutValkeyPeer +
+// WithUseMemoryFallback(true) + explicit memory_map_full_policy + wait_missing_ttl_policy.
+func WithoutValkeyPeer() Option {
+	return func(o *options) { o.requireValkey = false }
 }
 
 // WithMemoryMaxEntries sets the hard cap on distinct keys in the in-process
-// map (default 10000), shared by the unlocked memory backend and the
-// memory-fallback policy.
+// map (default 10000).
 func WithMemoryMaxEntries(n int) Option {
 	return func(o *options) { o.memoryMaxEntries = n }
+}
+
+// WithMemoryMapFullPolicy seeds memory_map_full_policy ("allow" or "deny").
+// Required at Init when use_memory_fallback or force_memory is true.
+func WithMemoryMapFullPolicy(policy string) Option {
+	return func(o *options) { o.memoryMapFullPolicy = policy }
+}
+
+// WithWaitMissingTTLPolicy seeds wait_missing_ttl_policy ("proceed" or
+// "error"). Required at Init.
+func WithWaitMissingTTLPolicy(policy string) Option {
+	return func(o *options) { o.waitMissingTTLPolicy = policy }
 }
 
 // WithMetricsEnabled toggles the metrics catalogue. When disabled,
@@ -394,10 +460,11 @@ func WithWaitDelayFunc(fn WaitDelayFunc) Option {
 
 // RateLimiter is the caerus-framework-http-ratelimiter component. It counts
 // attempts for logical keys in a shared store (a cf_valkey.CFValkey peer by
-// default; an in-process map when WithMemoryBackend is unlocked) and reports
-// allow/deny plus time-until-reset. It holds the valkey peer component (never
-// a client snapshot) and builds every command through the peer's live Client()
-// and prefix-aware Key(), so reconnects and key prefixes stay consistent.
+// default; an in-process map when force_memory / memory-only / MemoryFallback)
+// and reports allow/deny plus time-until-reset. It holds the valkey peer
+// component (never a client snapshot) and builds every command through the
+// peer's live Client() and prefix-aware Key(), so reconnects and key prefixes
+// stay consistent.
 type RateLimiter struct {
 	mu           sync.RWMutex
 	configSource string
@@ -411,19 +478,26 @@ type RateLimiter struct {
 	fw           *cf.CaerusFramework
 	logsSub      *cf_logs.Subscription
 
-	memoryBackend bool
-	memory        *memoryLimiter
+	requireValkey     bool
+	useMemoryFallback bool
+	forceMemory       bool
+	memoryMode        bool // true when operating without a usable valkey primary
+	valkeyLive        bool // true when Init saw a live Client()
+	memory            *memoryLimiter
 
-	keyPrefix            string
-	maxKeyLength         int
-	memoryMaxEntries     int
-	memoryFallbackLimit  int64
-	memoryFallbackWindow time.Duration
-	mapFullPolicy        MapFullPolicy
-	metricsEnabled       bool
-	hashIPKeys           bool
-	waitJitterMax        time.Duration
-	waitDelayFunc        WaitDelayFunc
+	keyPrefix              string
+	maxKeyLength           int
+	memoryMaxEntries       int
+	memoryFallbackLimit    int64
+	memoryFallbackWindow   time.Duration
+	mapFullPolicy          MapFullPolicy
+	mapFullPolicySet       bool
+	waitMissingTTLPolicy   MissingTTLPolicy
+	waitMissingTTLPolicyOK bool
+	metricsEnabled         bool
+	hashIPKeys             bool
+	waitJitterMax          time.Duration
+	waitDelayFunc          WaitDelayFunc
 
 	vk *cf_valkey.CFValkey // peer component, resolved at Init
 	// initialized mirrors whether Init completed successfully. Used by Health
@@ -453,10 +527,12 @@ type RateLimiter struct {
 	disabled      atomic.Uint64
 	rejectedEmpty atomic.Uint64
 	rejectedLong  atomic.Uint64
+	memoryPath    atomic.Uint64
+	missingTTL    atomic.Uint64
 }
 
-// New creates a rate-limiter component. The valkey peer (or memory backend)
-// is resolved at Init, not here.
+// New creates a rate-limiter component. The valkey peer (or memory path) is
+// resolved at Init, not here.
 func New(opts ...Option) *RateLimiter {
 	o := options{
 		logger:           slog.Default(),
@@ -465,6 +541,7 @@ func New(opts ...Option) *RateLimiter {
 		memoryMaxEntries: defaultMemoryMaxEntries,
 		metricsEnabled:   defaultMetricsEnabled,
 		waitJitterMax:    defaultWaitJitterMax,
+		requireValkey:    true,
 	}
 	for _, opt := range opts {
 		opt(&o)
@@ -479,7 +556,7 @@ func New(opts ...Option) *RateLimiter {
 		valkeyName:       o.valkeyName,
 		logger:           o.logger,
 		loggerSet:        o.loggerSet,
-		memoryBackend:    o.memoryBackend,
+		requireValkey:    o.requireValkey,
 		memory:           newMemoryLimiter(),
 		keyPrefix:        strings.TrimSuffix(o.keyPrefix, ":"),
 		maxKeyLength:     o.maxKeyLength,
@@ -489,15 +566,26 @@ func New(opts ...Option) *RateLimiter {
 		waitJitterMax:    o.waitJitterMax,
 		waitDelayFunc:    o.waitDelayFunc,
 	}
+	if o.useMemoryFallback != nil {
+		c.useMemoryFallback = *o.useMemoryFallback
+	}
+	if o.forceMemory != nil {
+		c.forceMemory = *o.forceMemory
+	}
+	if o.memoryMapFullPolicy != "" {
+		c.applyMapFullPolicy(o.memoryMapFullPolicy)
+	}
+	if o.waitMissingTTLPolicy != "" {
+		c.applyWaitMissingTTLPolicy(o.waitMissingTTLPolicy)
+	}
 	if o.loaded != nil {
 		c.applyConfig(*o.loaded)
 	}
 	return c
 }
 
-// applyConfig overlays non-zero fields of cfg onto the component's base
-// settings. It runs last, so a loaded config always wins over option-set
-// defaults. Callers must not hold the mutex.
+// applyConfig overlays non-zero / non-nil fields of cfg onto the component's
+// base settings. Callers must not hold the mutex.
 func (c *RateLimiter) applyConfig(cfg Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -511,6 +599,12 @@ func (c *RateLimiter) applyConfigLocked(cfg Config) {
 	}
 	if cfg.MetricsEnabled != nil {
 		c.metricsEnabled = *cfg.MetricsEnabled
+	}
+	if cfg.UseMemoryFallback != nil {
+		c.useMemoryFallback = *cfg.UseMemoryFallback
+	}
+	if cfg.ForceMemory != nil {
+		c.forceMemory = *cfg.ForceMemory
 	}
 	if cfg.MemoryMaxEntries > 0 {
 		c.memoryMaxEntries = cfg.MemoryMaxEntries
@@ -529,22 +623,58 @@ func (c *RateLimiter) applyConfigLocked(cfg Config) {
 			c.waitJitterMax = time.Duration(sec * float64(time.Second))
 		}
 	}
-	switch strings.ToLower(strings.TrimSpace(cfg.MemoryMapFullPolicy)) {
-	case "", "allow":
-		c.mapFullPolicy = MapFullAllow
-	case "deny":
-		c.mapFullPolicy = MapFullDeny
-	default:
-		c.logger.Warn("cf_http_ratelimiter: unknown memory_map_full_policy; defaulting to allow",
-			"policy", cfg.MemoryMapFullPolicy)
-		c.mapFullPolicy = MapFullAllow
+	if cfg.MemoryMapFullPolicy != "" {
+		c.applyMapFullPolicy(cfg.MemoryMapFullPolicy)
 	}
-	// Fallback limit/window are read from the component state by
-	// memoryFallbackConfig; only the configured (non-zero) values override.
+	if cfg.WaitMissingTTLPolicy != "" {
+		c.applyWaitMissingTTLPolicy(cfg.WaitMissingTTLPolicy)
+	}
 	c.memoryFallbackLimit = cfg.MemoryFallbackLimit
 	if cfg.MemoryFallbackWindowSec > 0 {
 		c.memoryFallbackWindow = time.Duration(cfg.MemoryFallbackWindowSec * float64(time.Second))
 	}
+}
+
+func (c *RateLimiter) applyMapFullPolicy(raw string) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "allow":
+		c.mapFullPolicy = MapFullAllow
+		c.mapFullPolicySet = true
+	case "deny":
+		c.mapFullPolicy = MapFullDeny
+		c.mapFullPolicySet = true
+	default:
+		c.mapFullPolicySet = false
+		c.mapFullPolicy = MapFullAllow
+	}
+}
+
+func (c *RateLimiter) applyWaitMissingTTLPolicy(raw string) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "proceed":
+		c.waitMissingTTLPolicy = MissingTTLProceed
+		c.waitMissingTTLPolicyOK = true
+	case "error":
+		c.waitMissingTTLPolicy = MissingTTLError
+		c.waitMissingTTLPolicyOK = true
+	default:
+		c.waitMissingTTLPolicyOK = false
+		c.waitMissingTTLPolicy = 0
+	}
+}
+
+// validateRequiredPolicies checks Init/reload invariants for explicit policies.
+// Call with the mutex held.
+func (c *RateLimiter) validateRequiredPolicies() error {
+	if !c.waitMissingTTLPolicyOK {
+		return errors.New(`cf_http_ratelimiter: wait_missing_ttl_policy is required ("proceed" or "error")`)
+	}
+	if c.useMemoryFallback || c.forceMemory {
+		if !c.mapFullPolicySet {
+			return errors.New(`cf_http_ratelimiter: memory_map_full_policy is required ("allow" or "deny") when use_memory_fallback or force_memory is true`)
+		}
+	}
+	return nil
 }
 
 // Name implements cf.CaerusComponent. Returns the custom name set via WithName,
@@ -559,14 +689,13 @@ func (c *RateLimiter) Name() string {
 // GetInitOrderStage implements cf.CaerusComponent.
 func (c *RateLimiter) GetInitOrderStage() cf.Stage { return ComponentStage }
 
-// GetDependencies implements cf.Dependencies. The valkey backend depends on
-// the valkey peer it consumes (the actual peer name when WithValkeyName is
-// set, the default ComponentName otherwise); the unlocked memory backend does
-// not. Both depend on logs, and on configuration when WithConfigSource is set.
-// Peer names are fixed at construction, so the graph is stable before Init.
+// GetDependencies implements cf.Dependencies. Always depends on logs, and on
+// configuration when WithConfigSource is set. Depends on the valkey peer unless
+// WithoutValkeyPeer was used (memory-only chassis). Peer names are fixed at
+// construction, so the graph is stable before Init.
 func (c *RateLimiter) GetDependencies() []string {
 	deps := []string{cf_logs.ComponentName}
-	if !c.memoryBackend {
+	if c.requireValkey {
 		peer := cf_valkey.ComponentName
 		if c.valkeyName != "" {
 			peer = c.valkeyName
@@ -588,11 +717,23 @@ func (c *RateLimiter) peerName() string {
 	return cf_valkey.ComponentName
 }
 
+// UseMemoryFallback reports whether the sticky-note engine is enabled.
+func (c *RateLimiter) UseMemoryFallback() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.useMemoryFallback
+}
+
+// ForceMemory reports whether break-glass sticky-note primary is enabled.
+func (c *RateLimiter) ForceMemory() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.forceMemory
+}
+
 // Init implements cf.CaerusComponent. It subscribes to the framework logs
-// component, applies the bound configuration source, and — unless the memory
-// backend was unlocked with WithMemoryBackend — resolves the valkey peer
-// component, failing fast when it is missing or not yet initialized. No
-// connection is opened here; the peer owns its client.
+// component, applies the bound configuration source, validates required
+// policies, and resolves the valkey peer when required.
 func (c *RateLimiter) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -610,21 +751,51 @@ func (c *RateLimiter) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			return err
 		}
 	}
-	if !c.memoryBackend {
-		var vk *cf_valkey.CFValkey
-		var ok bool
-		if c.valkeyName == "" {
-			vk, ok = cf.Get[*cf_valkey.CFValkey](fw)
+	if err := c.validateRequiredPolicies(); err != nil {
+		return err
+	}
+
+	if !c.requireValkey {
+		if !c.useMemoryFallback {
+			return errors.New("cf_http_ratelimiter: WithoutValkeyPeer requires use_memory_fallback=true")
+		}
+		c.memoryMode = true
+		c.valkeyLive = false
+		c.logger.Warn("cf_http_ratelimiter: running without a valkey peer (use_memory_fallback sticky-note chassis) — not shared across replicas")
+		c.initialized.Store(true)
+		return nil
+	}
+
+	var vk *cf_valkey.CFValkey
+	var ok bool
+	if c.valkeyName == "" {
+		vk, ok = cf.Get[*cf_valkey.CFValkey](fw)
+	} else {
+		vk, ok = cf.GetByName[*cf_valkey.CFValkey](fw, c.valkeyName)
+	}
+	if !ok {
+		return fmt.Errorf("cf_http_ratelimiter: valkey component %q is not registered (add it to the framework, or use WithoutValkeyPeer + use_memory_fallback=true for sticky-note-only)", c.peerName())
+	}
+	c.vk = vk
+	if vk.Client() == nil {
+		if !c.forceMemory {
+			return fmt.Errorf("cf_http_ratelimiter: valkey component %q is not initialized (enable DegradedMode on valkey and force_memory on the limiter for break-glass sticky notes)", c.peerName())
+		}
+		c.memoryMode = true
+		c.valkeyLive = false
+		c.logger.Error("cf_http_ratelimiter: force_memory — valkey peer has no live client since Init; using sticky-note path; not shared across replicas; pair DegradedMode + health_when_degraded deliberately")
+		c.initialized.Store(true)
+		return nil
+	}
+	c.valkeyLive = true
+	c.memoryMode = false
+	if c.forceMemory {
+		c.memoryMode = true // runtime prefers memory while force_memory is on
+		if c.useMemoryFallback {
+			c.logger.Error("cf_http_ratelimiter: lame_memory_mode — force_memory and use_memory_fallback are on while valkey is healthy; sticky notes are weaker than shared Valkey")
 		} else {
-			vk, ok = cf.GetByName[*cf_valkey.CFValkey](fw, c.valkeyName)
+			c.logger.Warn("cf_http_ratelimiter: force_memory on with healthy valkey; using sticky-note path")
 		}
-		if !ok {
-			return fmt.Errorf("cf_http_ratelimiter: valkey component %q is not registered (add it to the framework and to GetDependencies)", c.peerName())
-		}
-		if vk.Client() == nil {
-			return fmt.Errorf("cf_http_ratelimiter: valkey component %q is not initialized", c.peerName())
-		}
-		c.vk = vk
 	}
 	c.initialized.Store(true)
 	return nil
@@ -655,6 +826,8 @@ func (c *RateLimiter) Shutdown(ctx context.Context) error {
 		c.logsSub = nil
 	}
 	c.vk = nil
+	c.memoryMode = false
+	c.valkeyLive = false
 	c.initialized.Store(false)
 	return nil
 }
@@ -665,6 +838,14 @@ func (c *RateLimiter) peer() *cf_valkey.CFValkey {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.vk
+}
+
+// useMemoryPath reports whether Allow/Peek/Reset should use the in-process map
+// as the primary path (force_memory or memory-only chassis).
+func (c *RateLimiter) useMemoryPath() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.forceMemory || c.memoryMode
 }
 
 // client returns the peer's live valkey client. It follows the peer-pointer
@@ -754,13 +935,7 @@ func (c *RateLimiter) Allow(ctx context.Context, key string, limit int64, window
 	if err := c.validateKey(key); err != nil {
 		return Result{}, err
 	}
-	if c.memoryBackend {
-		return c.allowMemory(ctx, key, limit, window, MemoryFallbackConfig{
-			MaxEntries:  c.memoryMaxEntriesValue(),
-			WhenMapFull: c.mapFullPolicyValue(),
-		})
-	}
-	return c.allowValkey(ctx, key, limit, window)
+	return c.allowStorage(ctx, key, limit, window)
 }
 
 // allowValkey runs the fixed-window Lua counter against the peer's live client.
@@ -770,9 +945,10 @@ func (c *RateLimiter) allowValkey(ctx context.Context, key string, limit int64, 
 		c.storageErrors.Add(1)
 		return Result{}, err
 	}
+	storeKey := c.Key(key)
 	resp := client.Do(ctx, client.B().Eval().Script(luaAllow).
 		Numkeys(1).
-		Key(c.Key(key)).
+		Key(storeKey).
 		Arg(strconv.FormatInt(window.Milliseconds(), 10)).
 		Build())
 	if resp.Error() != nil {
@@ -784,14 +960,24 @@ func (c *RateLimiter) allowValkey(ctx context.Context, key string, limit int64, 
 		c.storageErrors.Add(1)
 		return Result{}, err
 	}
-	res := Result{ResetIn: window}
+	var count, pttl int64
 	if len(vals) >= 1 {
-		res.Count = vals[0]
+		count = vals[0]
 	}
-	if len(vals) >= 2 && vals[1] > 0 {
-		res.ResetIn = time.Duration(vals[1]) * time.Millisecond
+	if len(vals) >= 2 {
+		pttl = vals[1]
 	}
-	res.Allowed = res.Count <= limit
+	if count > 0 && pttl <= 0 {
+		if err := c.handleMissingTTL(ctx, client, storeKey, false); err != nil {
+			return Result{}, err
+		}
+		// proceed: scrubbed; run Allow once more on a fresh key.
+		return c.allowValkey(ctx, key, limit, window)
+	}
+	res := Result{Count: count, ResetIn: window, Allowed: count <= limit}
+	if pttl > 0 {
+		res.ResetIn = time.Duration(pttl) * time.Millisecond
+	}
 	if res.Allowed {
 		c.allows.Add(1)
 	} else {
@@ -803,6 +989,7 @@ func (c *RateLimiter) allowValkey(ctx context.Context, key string, limit int64, 
 // allowMemory runs the fixed-window counter against the in-process map using
 // the resolved fallback sizing.
 func (c *RateLimiter) allowMemory(ctx context.Context, key string, limit int64, window time.Duration, fb MemoryFallbackConfig) (Result, error) {
+	c.memoryPath.Add(1)
 	if fb.MaxEntries <= 0 {
 		fb.MaxEntries = c.memoryMaxEntriesValue()
 	}
@@ -822,12 +1009,13 @@ func (c *RateLimiter) allowMemory(ctx context.Context, key string, limit int64, 
 }
 
 // Reset deletes the counter for key (successful login / admin unlock). A
-// missing key is a success (idempotent).
+// missing key is a success (idempotent). The error string never includes the
+// logical key (avoid leaking hashed identities into logs).
 func (c *RateLimiter) Reset(ctx context.Context, key string) error {
 	if err := c.validateKey(key); err != nil {
 		return err
 	}
-	if c.memoryBackend {
+	if c.useMemoryPath() {
 		c.memory.Reset(ctx, key)
 		c.resets.Add(1)
 		return nil
@@ -839,7 +1027,7 @@ func (c *RateLimiter) Reset(ctx context.Context, key string) error {
 	}
 	if err := client.Do(ctx, client.B().Del().Key(c.Key(key)).Build()).Error(); err != nil {
 		c.storageErrors.Add(1)
-		return fmt.Errorf("cf_http_ratelimiter: reset %q: %w", key, err)
+		return fmt.Errorf("cf_http_ratelimiter: reset failed: %w", err)
 	}
 	c.resets.Add(1)
 	return nil
@@ -853,7 +1041,7 @@ func (c *RateLimiter) Peek(ctx context.Context, key string) (Result, error) {
 	if err := c.validateKey(key); err != nil {
 		return Result{}, err
 	}
-	if c.memoryBackend {
+	if c.useMemoryPath() {
 		res := c.memory.Peek(ctx, key)
 		c.peeks.Add(1)
 		return res, nil
@@ -863,9 +1051,10 @@ func (c *RateLimiter) Peek(ctx context.Context, key string) (Result, error) {
 		c.storageErrors.Add(1)
 		return Result{}, err
 	}
+	storeKey := c.Key(key)
 	resp := client.Do(ctx, client.B().Eval().Script(luaPeek).
 		Numkeys(1).
-		Key(c.Key(key)).
+		Key(storeKey).
 		Build())
 	if resp.Error() != nil {
 		c.storageErrors.Add(1)
@@ -876,15 +1065,46 @@ func (c *RateLimiter) Peek(ctx context.Context, key string) (Result, error) {
 		c.storageErrors.Add(1)
 		return Result{}, err
 	}
-	res := Result{}
+	var count, pttl int64
 	if len(vals) >= 1 {
-		res.Count = vals[0]
+		count = vals[0]
 	}
-	if len(vals) >= 2 && vals[1] > 0 {
-		res.ResetIn = time.Duration(vals[1]) * time.Millisecond
+	if len(vals) >= 2 {
+		pttl = vals[1]
+	}
+	if count > 0 && pttl <= 0 {
+		if err := c.handleMissingTTL(ctx, client, storeKey, true); err != nil {
+			return Result{}, err
+		}
+		c.peeks.Add(1)
+		return Result{}, nil // proceed: scrubbed → empty peek
+	}
+	res := Result{Count: count}
+	if pttl > 0 {
+		res.ResetIn = time.Duration(pttl) * time.Millisecond
 	}
 	c.peeks.Add(1)
 	return res, nil
+}
+
+// handleMissingTTL logs, counts, deletes the bad key, then applies the
+// component missing-TTL policy (or returns ErrMissingTTL). peekOnly is unused
+// beyond call-site clarity; policy is the same for Allow/Peek.
+func (c *RateLimiter) handleMissingTTL(ctx context.Context, client valkey.Client, storeKey string, _ bool) error {
+	c.missingTTL.Add(1)
+	c.logger.Error("cf_http_ratelimiter: counter missing TTL; scrubbing key")
+	_ = client.Do(ctx, client.B().Del().Key(storeKey).Build()).Error()
+	policy := c.missingTTLPolicyValue()
+	if policy == MissingTTLError {
+		return ErrMissingTTL
+	}
+	return nil
+}
+
+func (c *RateLimiter) missingTTLPolicyValue() MissingTTLPolicy {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.waitMissingTTLPolicy
 }
 
 // Wait blocks until a single Allow would succeed, then performs that Allow
@@ -893,6 +1113,11 @@ func (c *RateLimiter) Peek(ctx context.Context, key string) (Result, error) {
 // a small jitter, then tries Allow once. Sleep is interruptible by ctx.
 // A limit <= 0 returns immediately (limiter off for this call).
 func (c *RateLimiter) Wait(ctx context.Context, key string, limit int64, window time.Duration) error {
+	return c.WaitOpts(ctx, key, limit, window, WaitOptions{})
+}
+
+// WaitOpts is Wait with per-call overrides (missing-TTL policy, delay func).
+func (c *RateLimiter) WaitOpts(ctx context.Context, key string, limit int64, window time.Duration, opts WaitOptions) error {
 	if limit <= 0 {
 		c.disabled.Add(1)
 		c.disabledOnce.Do(func() {
@@ -904,15 +1129,17 @@ func (c *RateLimiter) Wait(ctx context.Context, key string, limit int64, window 
 		c.waitsErr.Add(1)
 		return err
 	}
+	ttlPolicy := c.missingTTLPolicyValue()
+	if opts.MissingTTLPolicy != nil {
+		ttlPolicy = *opts.MissingTTLPolicy
+	}
 	for {
-		peeked, err := c.Peek(ctx, key)
+		peeked, err := c.peekForWait(ctx, key, ttlPolicy)
 		if err != nil {
 			c.waitsErr.Add(1)
 			return err
 		}
 		if peeked.Count < limit {
-			// Room in the window: try one Allow. This is the single grant
-			// attempt per iteration; a lost race falls through to the sleep.
 			grant, err := c.Allow(ctx, key, limit, window)
 			if err != nil {
 				c.waitsErr.Add(1)
@@ -922,9 +1149,20 @@ func (c *RateLimiter) Wait(ctx context.Context, key string, limit int64, window 
 				c.waitsOK.Add(1)
 				return nil
 			}
-			peeked = grant // use the fresh ResetIn after the denied increment
+			peeked = grant
 		}
-		sleep, err := c.waitDelay(ctx, key, peeked.ResetIn)
+		if peeked.Count > 0 && peeked.ResetIn <= 0 {
+			// Must not busy-loop: scrub path should have run in Peek/Allow.
+			// If we still see this (race), apply policy again via Allow path.
+			c.logger.Error("cf_http_ratelimiter: Wait saw ResetIn<=0 after peek; refusing busy-loop")
+			c.missingTTL.Add(1)
+			if ttlPolicy == MissingTTLError {
+				c.waitsErr.Add(1)
+				return ErrMissingTTL
+			}
+			continue // proceed → Allow once on next iteration
+		}
+		sleep, err := c.waitDelayOpts(ctx, key, peeked.ResetIn, opts)
 		if err != nil {
 			c.waitsErr.Add(1)
 			return err
@@ -938,15 +1176,73 @@ func (c *RateLimiter) Wait(ctx context.Context, key string, limit int64, window 
 	}
 }
 
-// waitDelay resolves the sleep duration for a Wait pause. When a WaitDelayFunc
-// is installed it decides (returning 0 to skip sleeping or an error to abort);
-// otherwise it sleeps jittered (base + up to 10% of base, capped by
-// wait_jitter_max; no jitter when the cap is 0).
+// peekForWait is Peek with an optional missing-TTL policy override for the
+// scrub decision. When the primary path is memory, Peek has no missing-TTL.
+func (c *RateLimiter) peekForWait(ctx context.Context, key string, ttlPolicy MissingTTLPolicy) (Result, error) {
+	if c.useMemoryPath() {
+		res := c.memory.Peek(ctx, key)
+		c.peeks.Add(1)
+		return res, nil
+	}
+	client, err := c.client()
+	if err != nil {
+		c.storageErrors.Add(1)
+		return Result{}, err
+	}
+	storeKey := c.Key(key)
+	resp := client.Do(ctx, client.B().Eval().Script(luaPeek).
+		Numkeys(1).
+		Key(storeKey).
+		Build())
+	if resp.Error() != nil {
+		c.storageErrors.Add(1)
+		return Result{}, resp.Error()
+	}
+	vals, err := resp.AsIntSlice()
+	if err != nil {
+		c.storageErrors.Add(1)
+		return Result{}, err
+	}
+	var count, pttl int64
+	if len(vals) >= 1 {
+		count = vals[0]
+	}
+	if len(vals) >= 2 {
+		pttl = vals[1]
+	}
+	if count > 0 && pttl <= 0 {
+		c.missingTTL.Add(1)
+		c.logger.Error("cf_http_ratelimiter: counter missing TTL; scrubbing key")
+		_ = client.Do(ctx, client.B().Del().Key(storeKey).Build()).Error()
+		c.peeks.Add(1)
+		if ttlPolicy == MissingTTLError {
+			return Result{}, ErrMissingTTL
+		}
+		return Result{}, nil
+	}
+	res := Result{Count: count}
+	if pttl > 0 {
+		res.ResetIn = time.Duration(pttl) * time.Millisecond
+	}
+	c.peeks.Add(1)
+	return res, nil
+}
+
+// waitDelay resolves the sleep duration for a Wait pause.
 func (c *RateLimiter) waitDelay(ctx context.Context, key string, base time.Duration) (time.Duration, error) {
+	return c.waitDelayOpts(ctx, key, base, WaitOptions{})
+}
+
+func (c *RateLimiter) waitDelayOpts(ctx context.Context, key string, base time.Duration, opts WaitOptions) (time.Duration, error) {
 	c.mu.RLock()
 	fn := c.waitDelayFunc
 	jitterMax := c.waitJitterMax
 	c.mu.RUnlock()
+	if opts.delayFuncSet {
+		fn = opts.DelayFunc
+	} else if opts.DelayFunc != nil {
+		fn = opts.DelayFunc
+	}
 
 	jittered := base
 	if jitterMax > 0 && base > 0 {
@@ -984,9 +1280,16 @@ func sleepInterruptible(ctx context.Context, d time.Duration) error {
 // call sites that cannot use the HTTP middleware. On a primary-store error it
 // applies the policy: StorageFailOpen returns Allowed=true, StorageFailClosed
 // returns the error, StorageMemoryFallback delegates to the in-process memory
-// limiter using the component's configured fallback sizing. limit <= 0 still
-// short-circuits (disabled_total only) before any policy logic.
+// limiter (requires use_memory_fallback=true) using the component's configured fallback
+// sizing. limit <= 0 still short-circuits (disabled_total only) before any
+// policy logic.
 func (c *RateLimiter) AllowWithPolicy(ctx context.Context, key string, limit int64, window time.Duration, policy StorageErrorPolicy) (Result, error) {
+	return c.AllowWithPolicyOpts(ctx, key, limit, window, policy, MemoryFallbackConfig{})
+}
+
+// AllowWithPolicyOpts is AllowWithPolicy with per-call MemoryFallbackConfig
+// overrides (wired from MiddlewareConfig.Memory).
+func (c *RateLimiter) AllowWithPolicyOpts(ctx context.Context, key string, limit int64, window time.Duration, policy StorageErrorPolicy, memory MemoryFallbackConfig) (Result, error) {
 	if limit <= 0 {
 		return c.disabledCall(), nil
 	}
@@ -996,11 +1299,13 @@ func (c *RateLimiter) AllowWithPolicy(ctx context.Context, key string, limit int
 	if err := c.validateKey(key); err != nil {
 		return Result{}, err
 	}
+	if policy == StorageMemoryFallback && !c.UseMemoryFallback() {
+		return Result{}, ErrMemoryFallbackDisabled
+	}
 	res, err := c.allowStorage(ctx, key, limit, window)
 	if err == nil {
 		return res, nil
 	}
-	// allowStorage already counted the storage error.
 	switch policy {
 	case StorageFailOpen:
 		c.fbOpen.Add(1)
@@ -1010,29 +1315,51 @@ func (c *RateLimiter) AllowWithPolicy(ctx context.Context, key string, limit int
 		c.fbClosed.Add(1)
 		return Result{}, err
 	case StorageMemoryFallback:
+		if !c.UseMemoryFallback() {
+			return Result{}, ErrMemoryFallbackDisabled
+		}
 		c.fbMemory.Add(1)
-		fb := c.memoryFallbackConfig()
-		if fb.Limit <= 0 {
-			fb.Limit = limit
+		c.logger.Warn("cf_http_ratelimiter: store error; memory fallback", "err", err)
+		fb := c.mergeMemoryConfig(memory)
+		lim := limit
+		win := window
+		if fb.Limit > 0 {
+			lim = fb.Limit
 		}
-		if fb.Window <= 0 {
-			fb.Window = window
+		if fb.Window > 0 {
+			win = fb.Window
 		}
-		return c.allowMemory(ctx, key, fb.Limit, fb.Window, fb)
+		return c.allowMemory(ctx, key, lim, win, fb)
 	default:
 		return Result{}, fmt.Errorf("cf_http_ratelimiter: unknown storage error policy %d", policy)
 	}
 }
 
-// allowStorage dispatches to the active backend without applying any policy.
+// allowStorage dispatches to the active primary path without applying any
+// OnStoreError policy.
 func (c *RateLimiter) allowStorage(ctx context.Context, key string, limit int64, window time.Duration) (Result, error) {
-	if c.memoryBackend {
-		return c.allowMemory(ctx, key, limit, window, MemoryFallbackConfig{
-			MaxEntries:  c.memoryMaxEntriesValue(),
-			WhenMapFull: c.mapFullPolicyValue(),
-		})
+	if c.useMemoryPath() {
+		return c.allowMemory(ctx, key, limit, window, c.memoryFallbackConfig())
 	}
 	return c.allowValkey(ctx, key, limit, window)
+}
+
+// mergeMemoryConfig overlays call-site MemoryFallbackConfig onto component defaults.
+func (c *RateLimiter) mergeMemoryConfig(override MemoryFallbackConfig) MemoryFallbackConfig {
+	fb := c.memoryFallbackConfig()
+	if override.MaxEntries > 0 {
+		fb.MaxEntries = override.MaxEntries
+	}
+	if override.WhenMapFull == MapFullDeny {
+		fb.WhenMapFull = MapFullDeny
+	}
+	if override.Limit > 0 {
+		fb.Limit = override.Limit
+	}
+	if override.Window > 0 {
+		fb.Window = override.Window
+	}
+	return fb
 }
 
 // memoryFallbackConfig returns the component-configured fallback sizing.
@@ -1079,9 +1406,9 @@ func (c *RateLimiter) HashIPKeys() bool {
 }
 
 // OnConfigReload implements cf.ConfigReloader. It re-applies the module
-// tunables (key prefix, metrics, memory sizing, max key length, wait jitter)
-// from the bound configuration source. No connection is rebuilt: the valkey
-// peer owns client rotation, and this component is stateless over it.
+// tunables from the bound configuration source. Invalid required policies keep
+// last-good settings. No connection is rebuilt: the valkey peer owns client
+// rotation.
 func (c *RateLimiter) OnConfigReload(source string, cfg any) {
 	if source != c.configSource || !c.initialized.Load() {
 		return
@@ -1091,13 +1418,91 @@ func (c *RateLimiter) OnConfigReload(source string, cfg any) {
 		c.logger.Error("cf_http_ratelimiter: config reload rejected", "source", source, "type", fmt.Sprintf("%T", cfg))
 		return
 	}
-	c.applyConfig(*typed)
+	c.mu.Lock()
+	prev := snapshotTunables(c)
+	c.applyConfigLocked(*typed)
+	if err := c.validateRequiredPolicies(); err != nil {
+		restoreTunables(c, prev)
+		c.mu.Unlock()
+		c.logger.Error("cf_http_ratelimiter: config reload rejected; keeping last-good", "err", err)
+		return
+	}
+	// force_memory / use_memory_fallback flips at reload: recompute runtime path flags
+	// without dropping the peer pointer.
+	if c.vk != nil && c.vk.Client() != nil {
+		c.valkeyLive = true
+		c.memoryMode = c.forceMemory
+		if c.forceMemory && c.useMemoryFallback {
+			c.logger.Error("cf_http_ratelimiter: lame_memory_mode — force_memory and use_memory_fallback are on while valkey is healthy")
+		}
+	} else if c.vk != nil {
+		if c.forceMemory {
+			c.memoryMode = true
+			c.valkeyLive = false
+		}
+	}
+	c.mu.Unlock()
 	c.reloads.Add(1)
 	c.logger.Info("cf_http_ratelimiter: tunables reloaded",
 		"key_prefix", c.keyPrefixValue(),
 		"metrics_enabled", c.metricsEnabledValue(),
+		"use_memory_fallback", c.UseMemoryFallback(),
+		"force_memory", c.ForceMemory(),
 		"max_key_length", c.maxLen(),
 	)
+}
+
+type tunablesSnapshot struct {
+	keyPrefix              string
+	metricsEnabled         bool
+	useMemoryFallback      bool
+	forceMemory            bool
+	memoryMaxEntries       int
+	memoryFallbackLimit    int64
+	memoryFallbackWindow   time.Duration
+	mapFullPolicy          MapFullPolicy
+	mapFullPolicySet       bool
+	waitMissingTTLPolicy   MissingTTLPolicy
+	waitMissingTTLPolicyOK bool
+	hashIPKeys             bool
+	maxKeyLength           int
+	waitJitterMax          time.Duration
+}
+
+func snapshotTunables(c *RateLimiter) tunablesSnapshot {
+	return tunablesSnapshot{
+		keyPrefix:              c.keyPrefix,
+		metricsEnabled:         c.metricsEnabled,
+		useMemoryFallback:      c.useMemoryFallback,
+		forceMemory:            c.forceMemory,
+		memoryMaxEntries:       c.memoryMaxEntries,
+		memoryFallbackLimit:    c.memoryFallbackLimit,
+		memoryFallbackWindow:   c.memoryFallbackWindow,
+		mapFullPolicy:          c.mapFullPolicy,
+		mapFullPolicySet:       c.mapFullPolicySet,
+		waitMissingTTLPolicy:   c.waitMissingTTLPolicy,
+		waitMissingTTLPolicyOK: c.waitMissingTTLPolicyOK,
+		hashIPKeys:             c.hashIPKeys,
+		maxKeyLength:           c.maxKeyLength,
+		waitJitterMax:          c.waitJitterMax,
+	}
+}
+
+func restoreTunables(c *RateLimiter, s tunablesSnapshot) {
+	c.keyPrefix = s.keyPrefix
+	c.metricsEnabled = s.metricsEnabled
+	c.useMemoryFallback = s.useMemoryFallback
+	c.forceMemory = s.forceMemory
+	c.memoryMaxEntries = s.memoryMaxEntries
+	c.memoryFallbackLimit = s.memoryFallbackLimit
+	c.memoryFallbackWindow = s.memoryFallbackWindow
+	c.mapFullPolicy = s.mapFullPolicy
+	c.mapFullPolicySet = s.mapFullPolicySet
+	c.waitMissingTTLPolicy = s.waitMissingTTLPolicy
+	c.waitMissingTTLPolicyOK = s.waitMissingTTLPolicyOK
+	c.hashIPKeys = s.hashIPKeys
+	c.maxKeyLength = s.maxKeyLength
+	c.waitJitterMax = s.waitJitterMax
 }
 
 func (c *RateLimiter) keyPrefixValue() string {
@@ -1142,14 +1547,14 @@ func (c *RateLimiter) RegisterConfigSources(conf any) error {
 }
 
 // Health implements cf.HealthProvider. It reports unhealthy before Init or
-// after Shutdown. After Init with the valkey backend it delegates to the peer's
-// health (a real PING); with the unlocked memory backend it reports healthy
-// (the process-local map is ready).
+// after Shutdown. After Init in memory-only / force_memory sticky mode it
+// reports healthy (the process-local map is ready). With a Valkey primary it
+// delegates to the peer's health (a real PING).
 func (c *RateLimiter) Health(ctx context.Context) error {
 	if !c.initialized.Load() {
 		return errors.New("cf_http_ratelimiter: component is not initialized")
 	}
-	if c.memoryBackend {
+	if c.useMemoryPath() {
 		return nil
 	}
 	vk := c.peer()
