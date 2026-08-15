@@ -25,8 +25,8 @@ func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
 	if cfg.OnStoreError == nil {
 		return nil, errors.New("cf_http_ratelimiter: Middleware: OnStoreError is required — choosing this module means tuning store-error policy")
 	}
-	if *cfg.OnStoreError == StorageMemoryFallback && !cfg.Limiter.UseMemoryFallback() {
-		return nil, errors.New("cf_http_ratelimiter: Middleware: StorageMemoryFallback requires use_memory_fallback=true on the limiter")
+	if *cfg.OnStoreError == StorageMemoryFallback {
+		return nil, errors.New("cf_http_ratelimiter: Middleware: StorageMemoryFallback is removed; set rate_limit memory on valkey-state")
 	}
 	if cfg.KeyFunc == nil {
 		return nil, errors.New("cf_http_ratelimiter: Middleware: KeyFunc is required — use a trusted client identity (e.g. RemoteAddrKey or your mesh's normalized IP), not a client-supplied header")

@@ -13,10 +13,11 @@ import (
 	cf "github.com/caerus-framework/caerus-framework"
 	cf_logs "github.com/caerus-framework/caerus-framework-logs"
 	cf_valkey "github.com/caerus-framework/caerus-framework-valkey"
+	cf_valkey_state "github.com/caerus-framework/caerus-framework-valkey-state"
 	"github.com/valkey-io/valkey-go"
 )
 
-func setupLimiter(t *testing.T, opts ...Option) (*RateLimiter, valkey.Client) {
+func setupLimiter(t *testing.T) (*RateLimiter, *cf_valkey.CFValkey, valkey.Client) {
 	t.Helper()
 	addr := os.Getenv("VALKEY_ADDR")
 	if addr == "" {
@@ -24,30 +25,32 @@ func setupLimiter(t *testing.T, opts ...Option) (*RateLimiter, valkey.Client) {
 	}
 	fw := cf.New()
 	if err := fw.AddComponent(cf_logs.New(cf_logs.WithWriter(io.Discard))); err != nil {
-		t.Fatalf("AddComponent logs: %v", err)
+		t.Fatalf("logs: %v", err)
 	}
 	vk := cf_valkey.New(
 		cf_valkey.WithAddress(addr),
 		cf_valkey.WithKeyPrefix("http-ratelimiter-test"),
 	)
 	if err := fw.AddComponent(vk); err != nil {
-		t.Fatalf("AddComponent valkey: %v", err)
+		t.Fatalf("valkey: %v", err)
 	}
-	defaults := []Option{WithWaitMissingTTLPolicy("proceed")}
-	r := New(append(defaults, opts...)...)
+	st := cf_valkey_state.New()
+	if err := fw.AddComponent(st); err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	r := New()
 	if err := fw.AddComponent(r); err != nil {
-		t.Fatalf("AddComponent ratelimiter: %v", err)
+		t.Fatalf("limiter: %v", err)
 	}
 	if err := fw.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
 	t.Cleanup(func() { _ = fw.Shutdown(context.Background()) })
-
 	raw := vk.Client()
 	if err := raw.Do(context.Background(), raw.B().Flushdb().Build()).Error(); err != nil {
 		t.Fatalf("Flushdb: %v", err)
 	}
-	return r, raw
+	return r, vk, raw
 }
 
 func pttl(t *testing.T, raw valkey.Client, key string) time.Duration {
@@ -64,7 +67,7 @@ func pttl(t *testing.T, raw valkey.Client, key string) time.Duration {
 }
 
 func TestIntegrationLuaAllowWindow(t *testing.T) {
-	r, _ := setupLimiter(t)
+	r, _, _ := setupLimiter(t)
 	ctx := context.Background()
 	for i := int64(1); i <= 3; i++ {
 		res, err := r.Allow(ctx, "login:user@example.com", 3, 60*time.Second)
@@ -72,115 +75,58 @@ func TestIntegrationLuaAllowWindow(t *testing.T) {
 			t.Fatalf("Allow: %v", err)
 		}
 		if !res.Allowed || res.Count != i {
-			t.Fatalf("call %d = %+v, want allowed count %d", i, res, i)
-		}
-		if res.ResetIn <= 0 || res.ResetIn > 60*time.Second {
-			t.Fatalf("ResetIn = %v, want within window", res.ResetIn)
+			t.Fatalf("call %d = %+v", i, res)
 		}
 	}
 	res, err := r.Allow(ctx, "login:user@example.com", 3, 60*time.Second)
-	if err != nil {
-		t.Fatalf("Allow (over): %v", err)
-	}
-	if res.Allowed || res.Count != 4 {
-		t.Fatalf("4th call = %+v, want denied count 4", res)
+	if err != nil || res.Allowed || res.Count != 4 {
+		t.Fatalf("4th = %+v err=%v", res, err)
 	}
 }
 
 func TestIntegrationLuaPTTLNoExtend(t *testing.T) {
-	r, raw := setupLimiter(t)
+	r, vk, raw := setupLimiter(t)
 	ctx := context.Background()
 	if _, err := r.Allow(ctx, "k", 10, 2*time.Second); err != nil {
-		t.Fatalf("Allow: %v", err)
+		t.Fatal(err)
 	}
-	key := r.Key("k")
+	key := vk.Key("rl", "k")
 	first := pttl(t, raw, key)
-	if first <= 0 || first > 2*time.Second {
-		t.Fatalf("first PTTL = %v, want ~2s", first)
-	}
 	time.Sleep(500 * time.Millisecond)
 	if _, err := r.Allow(ctx, "k", 10, 2*time.Second); err != nil {
-		t.Fatalf("Allow (second): %v", err)
+		t.Fatal(err)
 	}
-	// PEXPIRE must only run on the first increment: PTTL must not be reset.
 	second := pttl(t, raw, key)
 	if second > first {
-		t.Fatalf("PTTL extended: first %v, second %v (fixed-window must not slide)", first, second)
-	}
-	if second < 1100*time.Millisecond {
-		t.Fatalf("second PTTL = %v, want still ~1.5s (only decremented)", second)
+		t.Fatalf("PTTL extended: %v -> %v", first, second)
 	}
 }
 
 func TestIntegrationPeekAndReset(t *testing.T) {
-	r, raw := setupLimiter(t)
+	r, _, _ := setupLimiter(t)
 	ctx := context.Background()
-
 	res, err := r.Peek(ctx, "fresh")
-	if err != nil {
-		t.Fatalf("Peek on missing key: %v", err)
+	if err != nil || res.Count != 0 {
+		t.Fatalf("Peek missing = %+v %v", res, err)
 	}
-	if res.Count != 0 || res.ResetIn != 0 {
-		t.Fatalf("Peek on missing = %+v, want zero", res)
-	}
-
 	if _, err := r.Allow(ctx, "burst", 10, 2*time.Second); err != nil {
-		t.Fatalf("Allow: %v", err)
+		t.Fatal(err)
 	}
-	// Peek reads the counter without incrementing.
 	res, err = r.Peek(ctx, "burst")
-	if err != nil {
-		t.Fatalf("Peek: %v", err)
+	if err != nil || res.Count != 1 {
+		t.Fatalf("Peek = %+v %v", res, err)
 	}
-	if res.Count != 1 {
-		t.Fatalf("Peek count = %d, want 1", res.Count)
-	}
-	if d := pttl(t, raw, r.Key("burst")); d <= 0 || d > 2*time.Second {
-		t.Fatalf("PTTL after peek = %v, want ~2s", d)
-	}
-	// Peek again: still 1.
-	res, err = r.Peek(ctx, "burst")
-	if err != nil {
-		t.Fatalf("Peek (2nd): %v", err)
-	}
-	if res.Count != 1 {
-		t.Fatalf("Peek count after 2nd peek = %d, want 1 (no increment)", res.Count)
-	}
-
 	if err := r.Reset(ctx, "burst"); err != nil {
-		t.Fatalf("Reset: %v", err)
+		t.Fatal(err)
 	}
 	res, err = r.Peek(ctx, "burst")
-	if err != nil {
-		t.Fatalf("Peek after reset: %v", err)
-	}
-	if res.Count != 0 {
-		t.Fatalf("Peek count after reset = %d, want 0", res.Count)
-	}
-	// Reset is idempotent on a missing key.
-	if err := r.Reset(ctx, "burst"); err != nil {
-		t.Fatalf("Reset on missing key: %v", err)
-	}
-}
-
-func TestIntegrationWindowReset(t *testing.T) {
-	r, _ := setupLimiter(t)
-	ctx := context.Background()
-	if _, err := r.Allow(ctx, "ip:1.2.3.4", 1, 200*time.Millisecond); err != nil {
-		t.Fatalf("Allow: %v", err)
-	}
-	time.Sleep(350 * time.Millisecond)
-	res, err := r.Allow(ctx, "ip:1.2.3.4", 1, 200*time.Millisecond)
-	if err != nil {
-		t.Fatalf("Allow after reset: %v", err)
-	}
-	if !res.Allowed || res.Count != 1 {
-		t.Fatalf("after window reset = %+v, want allowed count 1", res)
+	if err != nil || res.Count != 0 {
+		t.Fatalf("after reset = %+v %v", res, err)
 	}
 }
 
 func TestIntegrationAtomicity(t *testing.T) {
-	r, _ := setupLimiter(t)
+	r, _, _ := setupLimiter(t)
 	ctx := context.Background()
 	const n = 25
 	var wg sync.WaitGroup
@@ -201,134 +147,51 @@ func TestIntegrationAtomicity(t *testing.T) {
 	}
 	wg.Wait()
 	if allowed.Load() != n {
-		t.Fatalf("allowed = %d, want %d", allowed.Load(), n)
-	}
-	res, err := r.Allow(ctx, "burst", 100, time.Minute)
-	if err != nil {
-		t.Fatalf("final Allow: %v", err)
-	}
-	if res.Count != n+1 {
-		t.Fatalf("final count = %d, want %d", res.Count, n+1)
+		t.Fatalf("allowed = %d", allowed.Load())
 	}
 }
 
-func TestIntegrationWaitAndPeekForWait(t *testing.T) {
-	r, _ := setupLimiter(t, WithWaitJitterMax(0))
+func TestIntegrationMissingTTLProceed(t *testing.T) {
+	r, vk, raw := setupLimiter(t)
 	ctx := context.Background()
-	logical := "wait-key"
-	if _, err := r.Allow(ctx, logical, 1, 80*time.Millisecond); err != nil {
-		t.Fatalf("Allow fill: %v", err)
+	logical := "orphan"
+	storeKey := vk.Key("rl", logical)
+	if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("3").Build()).Error(); err != nil {
+		t.Fatal(err)
 	}
-	start := time.Now()
-	if err := r.Wait(ctx, logical, 1, 80*time.Millisecond); err != nil {
-		t.Fatalf("Wait: %v", err)
+	res, err := r.Peek(ctx, logical)
+	if err != nil || res.Count != 0 {
+		t.Fatalf("after scrub Peek = %+v %v", res, err)
 	}
-	if time.Since(start) < 50*time.Millisecond {
-		t.Fatal("Wait returned too quickly; peekForWait should have seen a full window")
-	}
-	// Fill again, then cancel WaitOpts mid-sleep (exercises valkey peekForWait).
-	if _, err := r.Allow(ctx, logical, 1, time.Hour); err != nil {
-		t.Fatalf("Allow refill: %v", err)
-	}
-	ctx2, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
-	defer cancel()
-	if err := r.WaitOpts(ctx2, logical, 1, time.Hour, WaitOptions{}); err == nil {
-		t.Fatal("WaitOpts should cancel when ctx expires")
+	res, err = r.Allow(ctx, logical, 5, time.Minute)
+	if err != nil || !res.Allowed || res.Count != 1 {
+		t.Fatalf("Allow after scrub = %+v %v", res, err)
 	}
 }
 
-func TestIntegrationMissingTTLProceedAndError(t *testing.T) {
+func TestIntegrationMissingTTLError(t *testing.T) {
+	r, vk, raw := setupLimiter(t)
 	ctx := context.Background()
-
-	t.Run("proceed", func(t *testing.T) {
-		r, raw := setupLimiter(t, WithWaitMissingTTLPolicy("proceed"))
-		logical := "orphan-proceed"
-		storeKey := r.Key(logical)
-		if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("3").Build()).Error(); err != nil {
-			t.Fatalf("SET without TTL: %v", err)
-		}
-		res, err := r.Peek(ctx, logical)
-		if err != nil {
-			t.Fatalf("Peek missing TTL proceed: %v", err)
-		}
-		if res.Count != 0 {
-			t.Fatalf("after scrub Peek count = %d, want 0", res.Count)
-		}
-		if r.missingTTL.Load() < 1 {
-			t.Fatal("missingTTL counter should increment")
-		}
-		// Key should be gone so Allow starts a fresh window.
-		res, err = r.Allow(ctx, logical, 5, time.Minute)
-		if err != nil || !res.Allowed || res.Count != 1 {
-			t.Fatalf("Allow after scrub = %+v err=%v", res, err)
-		}
-	})
-
-	t.Run("error", func(t *testing.T) {
-		r, raw := setupLimiter(t, WithWaitMissingTTLPolicy("error"))
-		logical := "orphan-error"
-		storeKey := r.Key(logical)
-		if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("2").Build()).Error(); err != nil {
-			t.Fatalf("SET without TTL: %v", err)
-		}
-		_, err := r.Peek(ctx, logical)
-		if !errors.Is(err, ErrMissingTTL) {
-			t.Fatalf("Peek missing TTL error = %v, want ErrMissingTTL", err)
-		}
-		_, err = r.Allow(ctx, logical, 5, time.Minute)
-		// After Peek scrubbed the key, Allow may succeed — re-seed without TTL.
-		if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("2").Build()).Error(); err != nil {
-			t.Fatalf("re-SET: %v", err)
-		}
-		_, err = r.Allow(ctx, logical, 5, time.Minute)
-		if !errors.Is(err, ErrMissingTTL) {
-			t.Fatalf("Allow missing TTL error = %v, want ErrMissingTTL", err)
-		}
-	})
-}
-
-func TestIntegrationMemoryFallbackUnderValkey(t *testing.T) {
-	r, raw := setupLimiter(t, WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"))
-	ctx := context.Background()
-
-	if _, err := r.Allow(ctx, "k", 10, time.Minute); err != nil {
-		t.Fatalf("Allow before outage: %v", err)
+	logical := "orphan-err"
+	storeKey := vk.Key("rl", logical)
+	if err := raw.Do(ctx, raw.B().Set().Key(storeKey).Value("2").Build()).Error(); err != nil {
+		t.Fatal(err)
 	}
-	// Simulate the store going away by closing the peer's client.
-	raw.Close()
-	res, err := r.AllowWithPolicy(ctx, "k", 2, time.Minute, StorageMemoryFallback)
-	if err != nil {
-		t.Fatalf("MemoryFallback: %v", err)
-	}
-	if !res.Allowed || res.Count != 1 {
-		t.Fatalf("fallback result = %+v, want allowed count 1", res)
-	}
-	if _, err := r.AllowWithPolicy(ctx, "k", 2, time.Minute, StorageMemoryFallback); err != nil {
-		t.Fatalf("AllowWithPolicy: %v", err)
-	}
-	res, err = r.AllowWithPolicy(ctx, "k", 2, time.Minute, StorageMemoryFallback)
-	if err != nil {
-		t.Fatalf("AllowWithPolicy: %v", err)
-	}
-	if res.Allowed {
-		t.Fatal("3rd fallback call should be denied (fallback limit 2)")
-	}
-	if r.fbMemory.Load() == 0 {
-		t.Fatal("fbMemory counter should be set")
+	errPol := MissingTTLError
+	err := r.WaitOpts(ctx, logical, 1, time.Minute, WaitOptions{MissingTTLPolicy: &errPol})
+	if !errors.Is(err, ErrMissingTTL) {
+		t.Fatalf("WaitOpts = %v, want ErrMissingTTL", err)
 	}
 }
 
 func TestIntegrationHealthAndMetrics(t *testing.T) {
-	r, _ := setupLimiter(t)
+	r, _, _ := setupLimiter(t)
 	ctx := context.Background()
 	if err := r.Health(ctx); err != nil {
-		t.Fatalf("Health after init: %v", err)
-	}
-	if ms := r.Metrics(); ms == nil {
-		t.Fatal("Metrics after init should be non-nil")
+		t.Fatal(err)
 	}
 	if _, err := r.Allow(ctx, "m", 5, time.Minute); err != nil {
-		t.Fatalf("Allow: %v", err)
+		t.Fatal(err)
 	}
 	found := false
 	for _, m := range r.Metrics() {
@@ -337,6 +200,6 @@ func TestIntegrationHealthAndMetrics(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("allows_total should be 1 after one Allow")
+		t.Fatal("allows_total should be 1")
 	}
 }

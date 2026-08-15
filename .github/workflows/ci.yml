@@ -14,6 +14,6 @@ jobs:
     uses: caerus-framework/caerus-framework/.github/workflows/go-module-ci.yml@main
     with:
       module: caerus-framework-http-ratelimiter
-      deps: "caerus-framework caerus-framework-logs caerus-framework-configuration caerus-framework-observability caerus-framework-valkey"
+      deps: "caerus-framework caerus-framework-logs caerus-framework-configuration caerus-framework-observability caerus-framework-valkey caerus-framework-valkey-state"
       valkey: true
       caerusvet: true
