@@ -1,29 +1,18 @@
 package cf_http_ratelimiter
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-
-	cf "github.com/caerus-framework/caerus-framework"
 )
 
 func memRL(t *testing.T) *RateLimiter {
 	t.Helper()
-	r := New(
-		WithoutValkeyPeer(),
-		WithUseMemoryFallback(true),
-		WithMemoryMapFullPolicy("allow"),
-		WithWaitMissingTTLPolicy("proceed"),
-		WithWaitJitterMax(0),
-	)
-	if err := r.Init(context.Background(), cf.New()); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
+	st := memoryState(t)
+	r := New(WithWaitJitterMax(0))
+	initLimiter(t, r, st)
 	return r
 }
 
@@ -227,7 +216,7 @@ func TestMiddlewareRetryAfterMatchesWindow(t *testing.T) {
 	}
 }
 
-func TestMiddlewareMemoryFallbackRequiresUseMemoryFallback(t *testing.T) {
+func TestMiddlewareRejectsMemoryFallbackPolicy(t *testing.T) {
 	r := New()
 	pol := StorageMemoryFallback
 	_, err := Middleware(MiddlewareConfig{
@@ -238,45 +227,7 @@ func TestMiddlewareMemoryFallbackRequiresUseMemoryFallback(t *testing.T) {
 		OnStoreError: &pol,
 	})
 	if err == nil {
-		t.Fatal("Middleware with MemoryFallback and use_memory_fallback=false should error")
-	}
-	if !strings.Contains(err.Error(), "use_memory_fallback") {
-		t.Fatalf("error = %v, want use_memory_fallback mention", err)
-	}
-}
-
-func TestMiddlewareMemoryFallbackOnStoreError(t *testing.T) {
-	// A valkey-backend limiter with no store (never Init'd): middleware should
-	// fall back to the in-memory map under StorageMemoryFallback.
-	r := New(WithMemoryMaxEntries(100), WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"), WithWaitJitterMax(0))
-	pol := StorageMemoryFallback
-	mw, err := Middleware(MiddlewareConfig{
-		Limiter:      r,
-		Limit:        2,
-		Window:       time.Minute,
-		KeyFunc:      func(r *http.Request) string { return "k" },
-		OnStoreError: &pol,
-	})
-	if err != nil {
-		t.Fatalf("Middleware: %v", err)
-	}
-	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	for i := 0; i < 2; i++ {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("call %d status = %d, want 200", i+1, rec.Code)
-		}
-	}
-	if r.fbMemory.Load() == 0 {
-		t.Fatal("memory-fallback policy should have fired (fbMemory counter)")
-	}
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("3rd status = %d, want 429 from fallback", rec.Code)
+		t.Fatal("Middleware with StorageMemoryFallback should error")
 	}
 }
 

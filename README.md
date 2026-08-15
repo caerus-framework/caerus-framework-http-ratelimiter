@@ -4,17 +4,16 @@
 [![codecov](https://codecov.io/gh/caerus-framework/caerus-framework-http-ratelimiter/graph/badge.svg)](https://codecov.io/gh/caerus-framework/caerus-framework-http-ratelimiter)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Caerus Framework HTTP Rate Limiter Component. Fixed-window rate limiting for
-HTTP services and outbound clients, backed by a Valkey peer (default) with an
-optional in-process sticky-note map (`use_memory_fallback` / `force_memory` /
-`StorageMemoryFallback`). It owns the lifecycle, configuration (file + env +
-flags), live reload of tunables, framework logging, and health/metrics — the
-app supplies the per-call limit, window, key, and store-error policy.
+Caerus Framework HTTP Rate Limiter. **Fixed-window** counting for inbound
+middleware (429 + `Retry-After`, never sleep) and outbound `Wait`. The
+**counter store** is `caerus-framework-valkey-state` (Lua on a valkey peer, or
+that module’s sticky-note map). This package does **not** import `valkey-go`,
+does not `Eval`, and does not own a second map.
 
-**Choosing this module means configuring storage-error policy per call site.**
-There is no silent fail-open: `Middleware` errors if `OnStoreError` is unset,
-and `AllowWithPolicy` always takes an explicit policy argument (see
-[Storage-error policy](#storage-error-policy)).
+**Choosing this module means configuring fail-open vs fail-closed per call
+site** when **state already failed**. There is no silent fail-open.
+`StorageMemoryFallback` is removed: Valkey vs memory is
+`valkey-state.json` → `rate_limit`.
 
 ## What it is (and is not — yet)
 
@@ -58,7 +57,7 @@ outbound `Wait` may.**
 
 ```mermaid
 flowchart TB
-  M["MODULE settings<br/>http-ratelimiter.json<br/>prefix, map size, jitter, …"]
+  M["MODULE settings<br/>http-ratelimiter.json<br/>metrics, hash_ip_keys, jitter"]
   A["APP settings<br/>myservice.json / myapirequestor.json<br/>loginLimit, ipLimit, …"]
   C["CALL SITE code<br/>OnStoreError, KeyFunc,<br/>this route's limit/window"]
   M --> A --> C
@@ -73,14 +72,13 @@ flowchart TD
   L -->|yes| D["ALLOW — no store<br/>disabled_total++"]
   L -->|no| V{validate key}
   V -->|fail| RJ["error / reject<br/>key_rejected_total"]
-  V -->|ok| S["primary store<br/>Valkey Lua INCR+PEXPIRE"]
+  V -->|ok| S["primary store<br/>valkey-state Allow"]
   S -->|OK| C{Count ≤ limit?}
   S -->|store ERROR| P["OnStoreError REQUIRED"]
   C -->|yes| N[next handler]
   C -->|no| DENY["429 + Retry-After<br/>no sleep"]
   P --> FO[FailOpen → ALLOW warn]
   P --> FC[FailClosed → DENY/503]
-  P --> MF["MemoryFallback → sticky-note map<br/>same Allow math"]
 ```
 
 ### Outbound `Wait` — may sleep
@@ -101,30 +99,14 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  K[logical key] --> V["Valkey<br/>shared across replicas<br/>normal prod"]
-  K --> M["In-process map per pod<br/>use_memory_fallback / force_memory / MemoryFallback<br/>multi-replica = split counters"]
+  K[logical key] --> S["valkey-state Allow/Peek/Reset"]
+  S --> V["Valkey Lua<br/>shared across replicas<br/>normal prod"]
+  S --> M["In-process map per pod<br/>rate_limit.use_memory_fallback / force_memory<br/>multi-replica = split counters"]
 ```
 
-### Two switches + DegradedMode (sticky notes)
-
-| Switch | Meaning |
-|---|---|
-| **`use_memory_fallback`** | Sticky-note engine **allowed**. Off → never count in-process; `StorageMemoryFallback` is illegal. |
-| **`force_memory`** | Break-glass: start/run on sticky notes when Valkey is wired but dead at Init (pair with valkey **DegradedMode**). Prefer memory at runtime while set. |
-| **`lame_memory_mode` metric** | Both switches on **and** Valkey healthy — shame gauge (you chose sticky notes for no good reason). |
-
-| Situation | Result |
-|---|---|
-| Valkey **not** in Components + `WithoutValkeyPeer` + `use_memory_fallback=true` | Sticky-only (S0) |
-| Valkey wired, `Client()` nil, `force_memory=false` | Init **FAIL** |
-| Valkey wired, `Client()` nil, `force_memory=true` | Sticky + scream |
-| Valkey OK, runtime error, `use_memory_fallback` + MemoryFallback | Sticky + scream |
-| Valkey OK, both switches on | Sticky + `lame_memory_mode` |
-
-`/readyz` still aggregates every `HealthProvider`. DegradedMode on valkey lets
-**Initialize** finish; it does **not** make Valkey healthy. For “take traffic
-on sticky notes,” use a deliberate valkey `health_when_degraded: ready` on a
-**dedicated** limiter valkey instance — not as a quiet default.
+Sticky-note switches and DegradedMode live on **valkey-state** (`rate_limit` in
+`valkey-state.json`), not on this module. See that README. The limiter only
+chooses FailOpen vs FailClosed after state already returned an error.
 
 ### One-line model
 
@@ -132,21 +114,17 @@ on sticky notes,” use a deliberate valkey `health_when_degraded: ready` on a
 |---|---|
 | **Inbound** | count → deny fast (429) → **never sleep** |
 | **Outbound** | count → sleep until slot → Allow once |
-| **Valkey down + MemoryFallback** (`use_memory_fallback` on) | local map; watch `policy_fallbacks_total` |
-| **FailOpen** / **FailClosed** | let through / deny-or-503 |
+| **FailOpen** / **FailClosed** | after state error: let through / deny-or-503 |
 
 ## Wiring
 
-Two wiring shapes are supported. Prefer the **app-owned** shape (golden
-path): `main` declares the limiter as chassis next to valkey, and the app
-class resolves it as a peer at `Init`. Use the simple `main`-level shape for
-one-off binaries (and see [Recipe C](#recipe-c--local--ci-memory-only-without-valkey)
-for memory-only local runs).
+Two wiring shapes. Prefer the **app-owned** shape. The limiter **always**
+depends on **valkey-state** (component `Name()`, default `"valkey-state"`).
+Valkey is state’s peer, not the limiter’s.
 
 ### Golden path (app-owned consumer)
 
-`main` declares valkey + the limiter + the app class; it never touches the
-limiter directly:
+`main` declares valkey + valkey-state + limiter + the app class:
 
 ```go
 fw := cf.New(&cf.FrameworkOptions{
@@ -155,71 +133,58 @@ fw := cf.New(&cf.FrameworkOptions{
 	Components: []cf.CaerusComponent{
 		cf_valkey.New(cf_valkey.WithConfigSource("valkey", "config/valkey.json"),
 			cf_valkey.WithKeyPrefix("myservice:")),
+		cf_valkey_state.New(cf_valkey_state.WithConfigSource("valkey-state", "config/valkey-state.json")),
 		cf_http_ratelimiter.New(
 			cf_http_ratelimiter.WithConfigSource("http-ratelimiter", "config/http-ratelimiter.json"),
 		),
 		app.New(),
 	},
 })
-if err := fw.RunWithSignals(context.Background()); err != nil {
-	log.Fatal(err)
-}
 ```
 
-The app resolves the limiter **component pointer** once at `Init`, declares it
-in `GetDependencies`, and calls `Allow`/`Reset`/`Wait` (or builds `Middleware`)
-per use. Never copy the limiter or its client — always keep the pointer and
-call its methods, because the valkey peer swaps its client on reload:
+The app resolves the **limiter** pointer at `Init` and lists
+`cf_http_ratelimiter.ComponentName` in `GetDependencies`. It never lists
+`"valkey"` for the limiter’s sake. Logical keys go to `Allow` / `Middleware`;
+state builds `rl:` via unexported `rlKey`.
 
 ```go
-type App struct {
-	rl *cf_http_ratelimiter.RateLimiter
-}
-
 func (a *App) GetDependencies() []string {
-	return []string{
-		cf_http_ratelimiter.ComponentName, // "http-ratelimiter" — the component name, NOT a shortened nickname
-		// + logs, valkey, …
-	}
-}
-
-func (a *App) Init(ctx context.Context, fw *cf.CaerusFramework) error {
-	rl, ok := cf.Get[*cf_http_ratelimiter.RateLimiter](fw)
-	if !ok {
-		return errors.New("app: http-ratelimiter missing")
-	}
-	a.rl = rl
-	return nil
+	return []string{cf_http_ratelimiter.ComponentName}
 }
 ```
 
-The limiter needs a **Valkey peer**. It resolves it at `Init` via `cf.Get`
-(or `cf.GetByName` when you set `WithValkeyName`), and it calls
-`vk.Client()`/`vk.Key()` **per use** — it never snapshots the valkey client,
-so the peer's reconnect/reload keeps working underneath.
+### Simple path — GH App / memory-only (no valkey)
+
+There is **no** `WithoutValkeyPeer` on the limiter. State omits the fridge:
+
+```go
+st := cf_valkey_state.New(
+	cf_valkey_state.WithoutValkeyPeer(),
+	cf_valkey_state.WithForceMemory(true),
+	cf_valkey_state.WithUseMemoryFallback(true),
+	cf_valkey_state.WithMemoryMapFullPolicy("allow"),
+	cf_valkey_state.WithConfigSource("valkey-state", "config/valkey-state.json"),
+)
+rl := cf_http_ratelimiter.New(
+	cf_http_ratelimiter.WithConfigSource("http-ratelimiter", "config/http-ratelimiter.json"),
+)
+// Components: st, rl, http, app — no valkey
+```
+
+`CreateSession` on that state instance errors. Ready can be green (not mixed).
 
 ### Simple `main`-level wiring
-
-For a one-off binary (MyAPIRequestor's local dry-run CLI, tests, local tools),
-register the components directly and use `cf.MustGet`:
 
 ```go
 fw := cf.New()
 fw.AddComponent(cf_logs.New(cf_logs.WithWriter(os.Stdout)))
 fw.AddComponent(cf_valkey.New(cf_valkey.WithAddress("127.0.0.1:6379")))
-rl := cf_http_ratelimiter.New(
-	cf_http_ratelimiter.WithConfigSource("http-ratelimiter", "config/http-ratelimiter.json"),
-)
-fw.AddComponent(rl)
-// …
-rl, _ = cf.MustGet[*cf_http_ratelimiter.RateLimiter](fw)
+fw.AddComponent(cf_valkey_state.New())
+fw.AddComponent(cf_http_ratelimiter.New())
 ```
 
-The component is `ConfigSourceRegistrar`-self-sufficient: `WithConfigSource`
-registers the `Source[http_ratelimiter.Config]` with the configuration
-component during argv absorption, so `main` never touches
-`os.Getenv`/`ParseFlags`. The `--http-ratelimiter` path flag and the per-field
-flags come from that declaration.
+The limiter is `ConfigSourceRegistrar`-self-sufficient. `OnStoreError` is only
+**fail-open** or **fail-closed**. Memory is not a limiter policy.
 
 ### Component name vs configuration source name
 
@@ -272,13 +237,14 @@ config value (e.g. `loginLimit: 0`) silently disabled the limiter.
 ### Keys
 
 Keys are logical strings: a prefix plus an opaque identity, e.g.
-`"login:" + hex`, `"ip:" + ip`, `"externalapi:rest:42"`. The component places the
-valkey peer's prefix and the module's `key_prefix` underneath, so apps never
-hardcode full Redis key names.
+`"login:" + hex`, `"ip:" + ip`, `"externalapi:rest:42"`. The valkey-state
+peer places the valkey `Key()` prefix and an unexported `rl:` segment
+underneath, so apps never hardcode full Redis key names.
 
 **Max logical key length is enforced** (default **256 bytes**): empty or
 oversized keys are **rejected with an error, never truncated**, and counted in
-`http_ratelimiter_key_rejected_total{reason="empty"|"too_long"}` **before** any
+`http_ratelimiter_key_rejected_empty_total` /
+`http_ratelimiter_key_rejected_long_total` **before** any
 storage access. 256 bytes comfortably fits `login:` + 64 hex chars
 (HMAC-SHA256) or `ip:` + an IPv6 address, and rejects accidental dumps.
 Override with `WithMaxKeyLength(n)` or `max_key_length` (reloadable).
@@ -322,28 +288,26 @@ goroutines are not held open.
 
 ## Storage-error policy
 
-The limiter's clipboard is Valkey. When the clipboard is missing (Valkey
-down, network blip) the call site needs a rule:
+The limiter talks to **valkey-state**. When **that** call already failed
+(Valkey and sticky notes both unusable, or memory disabled), the call site
+needs a rule:
 
 | Rule | Plain English |
 |---|---|
-| **`StorageFailOpen`** | "Clipboard broken → let them in anyway." Site stays up; attackers also get in with no limits. |
-| **`StorageFailClosed`** | "Clipboard broken → nobody gets in." Safer; real users may see 429/503 until Valkey is back. |
-| **`StorageMemoryFallback`** | "Clipboard broken → use a sticky note on the desk." Still some limits, only on this one server. |
+| **`StorageFailOpen`** | "Store failed → let them in anyway." Site stays up; attackers also get in with no limits. |
+| **`StorageFailClosed`** | "Store failed → nobody gets in." Safer; real users may see 429/503. |
+
+**`StorageMemoryFallback` is an error.** Valkey vs sticky notes is
+`valkey-state.json` → `rate_limit`, not a per-call policy.
 
 **Why "unset" is dangerous:** in Go, `StorageFailOpen` is the zero value of
 the enum, so "forgot the field" and "I chose FailOpen" look identical. A
 junior can copy middleware, omit `OnStoreError`, and silently ship an unlocked
 door. So:
 
-- `Middleware` **errors** if `OnStoreError` is nil.
+- `Middleware` **errors** if `OnStoreError` is nil (or is MemoryFallback).
 - `AllowWithPolicy(ctx, key, limit, window, policy)` **always** takes an
   explicit policy argument — there is no overload that defaults it.
-
-This is **different** from map-full unset→allow below. Map-full is a narrow
-edge case *inside* an already-chosen MemoryFallback. `OnStoreError` is the
-**main safety switch** for "Valkey is dead — what now?" The former may default
-to permissive; the latter never does.
 
 The default `OnDenied` response is `429` with `Retry-After` set from
 `Result.ResetIn` (rounded up, so the client never retries early). A FailClosed
@@ -359,26 +323,16 @@ caller-supplied (the app owns its own policy on its own config source).
 
 | Field | Env | Default | Meaning |
 |---|---|---|---|
-| `key_prefix` | `HTTP_RATELIMITER_KEY_PREFIX` | `"rl"` | extra logical prefix under the valkey peer's `Key()` |
 | `metrics_enabled` | `HTTP_RATELIMITER_METRICS_ENABLED` | `true` | `Metrics()` returns `nil` when false (pointer so "omitted" ≠ "off") |
-| `use_memory_fallback` | `HTTP_RATELIMITER_USE_MEMORY_FALLBACK` | `false` | sticky-note engine enabled (required for MemoryFallback / no-valkey chassis) |
-| `force_memory` | `HTTP_RATELIMITER_FORCE_MEMORY` | `false` | break-glass sticky primary (wired-but-dead Init; prefer memory at runtime) |
-| `memory_max_entries` | `HTTP_RATELIMITER_MEMORY_MAX_ENTRIES` | `10000` | hard cap on distinct keys in the in-process map |
-| `memory_fallback_limit` | `HTTP_RATELIMITER_MEMORY_FALLBACK_LIMIT` | call's limit | coarser fallback limit; `0` → use the call's limit |
-| `memory_fallback_window_sec` | `HTTP_RATELIMITER_MEMORY_FALLBACK_WINDOW_SEC` | call's window | coarser fallback window; `0` → use the call's window |
-| `memory_map_full_policy` | `HTTP_RATELIMITER_MEMORY_MAP_FULL_POLICY` | **required** when `use_memory_fallback` or `force_memory` | `"allow"` or `"deny"` — Init/reload fails if missing/invalid while memory may be used |
-| `wait_missing_ttl_policy` | `HTTP_RATELIMITER_WAIT_MISSING_TTL_POLICY` | **required** | `"proceed"` or `"error"` after scrubbing a count>0 / PTTL≤0 key |
 | `hash_ip_keys` | `HTTP_RATELIMITER_HASH_IP_KEYS` | `false` | app-facing toggle: apps should HMAC IPs in `KeyFunc` when true (see Key material) |
 | `max_key_length` | `HTTP_RATELIMITER_MAX_KEY_LENGTH` | `256` | max logical key bytes; oversize is rejected, never truncated |
 | `wait_jitter_max_sec` | `HTTP_RATELIMITER_WAIT_JITTER_MAX_SEC` | ~10% of reset, capped 1s | max extra `Wait` sleep; `0` disables jitter |
 
-**Map-full is explicit.** When `use_memory_fallback` or `force_memory` is true you must set
-`memory_map_full_policy` to `"allow"` or `"deny"` — there is no silent default.
-Expired map entries are swept before the cap check. There is no LRU eviction.
+Counter memory, `force_memory`, map-full, and missing-TTL live on
+**valkey-state** (`rate_limit`), not here.
 
-Tunables reload live (`OnConfigReload`, `http_ratelimiter_config_reloads_total`).
-There is **no connection rebuild** — the valkey peer owns client rotation, the
-limiter just re-reads prefix/metrics/sizing.
+Tunables reload live (`OnConfigReload`). There is **no** connection rebuild —
+the valkey peer owns client rotation; state owns the store.
 
 ### Options
 
@@ -387,16 +341,9 @@ limiter just re-reads prefix/metrics/sizing.
 | `WithConfig(Config)` | static config snapshot; non-zero fields override option-set defaults |
 | `WithConfigSource(name, path, …)` | bind a configuration source (registers it via `ConfigSourceRegistrar`; declares a `configuration` dep). `WithSourceEnvPrefix`, `WithSourceFormat` available |
 | `WithName(name)` | custom component name for multiple instances (default `"http-ratelimiter"`) |
-| `WithValkeyName(name)` | bind to a valkey component with the given name (default `"valkey"`) |
+| `WithStateName(name)` | bind to a valkey-state component with the given name (default `"valkey-state"`) |
 | `WithLogger(*slog.Logger)` | explicit logger override; defaults to the framework `logs` component logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` |
-| `WithKeyPrefix(prefix)` | logical key prefix (default `"rl"`); trailing `:` trimmed |
 | `WithMaxKeyLength(n)` | maximum logical key bytes (default `256`) |
-| `WithUseMemoryFallback(bool)` | enable/disable sticky-note capability (`use_memory_fallback`) |
-| `WithForceMemory(bool)` | enable/disable break-glass sticky primary (`force_memory`) |
-| `WithoutValkeyPeer()` | omit valkey from `GetDependencies` (memory-only chassis; requires `use_memory_fallback=true`) |
-| `WithMemoryMapFullPolicy("allow"\|"deny")` | seed required map-full policy |
-| `WithWaitMissingTTLPolicy("proceed"\|"error")` | seed required missing-TTL policy |
-| `WithMemoryMaxEntries(n)` | cap on distinct map keys (default `10000`) |
 | `WithMetricsEnabled(bool)` | toggle the metrics catalogue (default on) |
 | `WithWaitJitterMax(d)` | cap `Wait` jitter (default `1s`); `0` disables |
 | `WithWaitDelayFunc(fn)` | app-supplied pause/abort decision for `Wait` |
@@ -449,26 +396,31 @@ floods, lock accounts after bad passwords, and stay up if Valkey blips.
 |---|---|---|
 | IP middleware on public `/api/session/*` | **`StorageFailOpen`** | prefer taking logins over 503ing everyone when Valkey is down |
 | Register | **`StorageFailOpen`** | same availability bias |
-| Login lockout | **`StorageMemoryFallback`** (needs `use_memory_fallback: true`) | key = `login:` + **HMAC hash of email** (never raw email in Valkey) |
+| Login lockout | **`StorageFailClosed`** (enable sticky notes on **valkey-state** `rate_limit` if you still want a per-pod cap when Valkey blips) | key = `login:` + **HMAC hash of email** (never raw email in Valkey) |
 | Map full (fallback) | **explicit** `allow` or `deny` | no silent default |
 | On success | **`Reset` the same hashed key** | clear the counter so a successful user is not half-locked |
 | IP keys | plain or hashed | start plain for ops; set `hash_ip_keys: true` when Valkey is shared / privacy-sensitive |
 
-`config/http-ratelimiter.json` (module settings — start here):
+`config/http-ratelimiter.json` (HTTP leftovers):
 
 ```json
 {
-  "key_prefix": "rl",
   "metrics_enabled": true,
-  "use_memory_fallback": true,
-  "force_memory": false,
-  "memory_max_entries": 10000,
-  "memory_fallback_limit": 20,
-  "memory_fallback_window_sec": 900,
-  "memory_map_full_policy": "allow",
-  "wait_missing_ttl_policy": "proceed",
   "hash_ip_keys": false,
   "max_key_length": 256
+}
+```
+
+`config/valkey-state.json` (counter store — start here for memory):
+
+```json
+{
+  "rate_limit": {
+    "use_memory_fallback": true,
+    "force_memory": false,
+    "memory_max_entries": 10000,
+    "memory_map_full_policy": "allow"
+  }
 }
 ```
 
@@ -524,7 +476,7 @@ loginKey := "login:" + a.keyHasher.Hash(normalizedEmail)
 res, err := a.rl.AllowWithPolicy(ctx, loginKey,
 	int64(cfg.RateLimit.LoginLimit),
 	time.Duration(cfg.RateLimit.LoginWindowMinutes)*time.Minute,
-	cf_http_ratelimiter.StorageMemoryFallback,
+	cf_http_ratelimiter.StorageFailClosed,
 )
 if err != nil {
 	// log it; the policy already decided what to do
@@ -553,20 +505,27 @@ not stampede ExternalAPIWeCall.
 |---|---|---|
 | `POST /hooks/events` middleware | **`StorageFailClosed`** (429 or 503 + Retry-After) | not end-user UX; upstream can retry; do not fail-open into the worker |
 | Outbound ExternalAPIWeCall REST self-pace | `Wait`/`Allow` | **we** are the client — sleep/jitter until our ceiling allows another call |
-| Local dry-run CLI | **Recipe C** (no valkey peer) | `WithoutValkeyPeer` + `use_memory_fallback` |
-| Map full | **explicit** `allow` or `deny` | raise `memory_max_entries` if needed |
+| Local dry-run CLI | **Recipe C** (no valkey peer) | state `WithoutValkeyPeer` + `rate_limit` memory |
+| Map full | **explicit** `allow` or `deny` on **valkey-state** | raise `memory_max_entries` if needed |
 
 `config/http-ratelimiter.json`:
 
 ```json
 {
-  "key_prefix": "rl",
-  "metrics_enabled": true,
-  "use_memory_fallback": true,
-  "force_memory": false,
-  "memory_max_entries": 5000,
-  "memory_map_full_policy": "allow",
-  "wait_missing_ttl_policy": "proceed"
+  "metrics_enabled": true
+}
+```
+
+`config/valkey-state.json`:
+
+```json
+{
+  "rate_limit": {
+    "use_memory_fallback": true,
+    "force_memory": false,
+    "memory_max_entries": 5000,
+    "memory_map_full_policy": "allow"
+  }
 }
 ```
 
@@ -621,35 +580,39 @@ lock/lease, not the limiter.
 
 ### Recipe C — Local / CI (memory-only, without Valkey)
 
-When the process has **no** valkey component, omit it from `GetDependencies`
-and enable sticky notes explicitly:
+When the process has **no** valkey component, omit it on **valkey-state**, not
+on the limiter:
 
 ```go
+st := cf_valkey_state.New(
+	cf_valkey_state.WithoutValkeyPeer(),
+	cf_valkey_state.WithForceMemory(true),
+	cf_valkey_state.WithUseMemoryFallback(true),
+	cf_valkey_state.WithMemoryMapFullPolicy("allow"),
+	cf_valkey_state.WithConfigSource("valkey-state", "config/valkey-state.json"),
+)
 rl := cf_http_ratelimiter.New(
-	cf_http_ratelimiter.WithoutValkeyPeer(), // GetDependencies: logs only
-	cf_http_ratelimiter.WithUseMemoryFallback(true),
-	cf_http_ratelimiter.WithMemoryMapFullPolicy("allow"),
-	cf_http_ratelimiter.WithWaitMissingTTLPolicy("proceed"),
-	cf_http_ratelimiter.WithMemoryMaxEntries(1000),
+	cf_http_ratelimiter.WithConfigSource("http-ratelimiter", "config/http-ratelimiter.json"),
 )
 ```
 
-Wrong: omit valkey from `Components` but leave the default valkey dependency —
-`Validate` fails. Right: `WithoutValkeyPeer` + `use_memory_fallback=true` + explicit
-map-full and missing-TTL policies. Do **not** use memory-only as the sole
-backend for multi-replica MyService in production.
+Wrong: omit valkey from `Components` but leave state’s default valkey
+dependency — `Validate` fails. Right: state’s `WithoutValkeyPeer` +
+`rate_limit.use_memory_fallback=true` + explicit map-full policy. Do **not**
+use memory-only as the sole backend for multi-replica MyService in production.
 
 **Break-glass with Valkey wired but dead — not automatic.**  
 By default Valkey Init is **hard**: unreachable store → that component’s Init
 fails → the whole process does not finish Initialize. Nothing “auto-enables”
-DegradedMode or `force_memory`. You must turn both on on purpose.
+DegradedMode or `force_memory`. You must turn them on on purpose.
 
 1. **Valkey** — allow Init without a live ping (`degraded_mode`).  
-2. **Limiter** — allow sticky-note primary when `Client()` is nil (`force_memory`),
-   and usually enable the sticky engine (`use_memory_fallback`).
+2. **valkey-state** — sticky-note primary when `Client()` is nil (`force_memory`),
+   and usually enable the sticky engine (`use_memory_fallback`). Mixed processes
+   (sessions + rate limit on one valkey) keep `/readyz` red unless you
+   deliberately set `health_when_degraded: ready` on a **dedicated** instance.
 
-`config/valkey.json` (or a dedicated limiter instance file, e.g.
-`config/valkey-rl.json`):
+`config/valkey.json`:
 
 ```json
 {
@@ -659,38 +622,29 @@ DegradedMode or `force_memory`. You must turn both on on purpose.
 }
 ```
 
-| Setting | Meaning |
-|---|---|
-| `degraded_mode: true` | Valkey Init may succeed even if ping/create fails (logs/metrics scream). **Off by default.** |
-| `health_when_degraded: "not_ready"` | Default — `/readyz` still fails while disconnected (pod up, no LB traffic). |
-| `health_when_degraded: "ready"` | Break-glass — Valkey Health returns OK while down so LB may send traffic. Use only on a **dedicated** limiter Valkey if the same process also has a hard session/DB store. |
-
-`config/http-ratelimiter.json` (same process):
+`config/valkey-state.json` (same process):
 
 ```json
 {
-  "key_prefix": "rl",
-  "use_memory_fallback": true,
-  "force_memory": true,
-  "memory_map_full_policy": "deny",
-  "wait_missing_ttl_policy": "proceed"
+  "rate_limit": {
+    "use_memory_fallback": true,
+    "force_memory": true,
+    "memory_map_full_policy": "deny"
+  }
 }
 ```
 
-Watch metrics: `force_memory`, `lame_memory_mode` (both limiter switches on
-*and* Valkey later healthy), plus Valkey `degraded_mode` /
+Watch state’s memory / lame-mode metrics plus Valkey `degraded_mode` /
 `degraded_unreachable` / `degraded_mode_uses_total`.
 
-**Hot reload can save the day sometimes.** Both components reload from their
+**Hot reload can save the day sometimes.** State and valkey reload from their
 config sources (file change / `Reload` / SIGHUP — env alone does not wake a
-running process). Ops can flip limiter switches (`force_memory`,
-`use_memory_fallback`, map-full / missing-TTL policies) and Valkey reconnect
+running process). Ops can flip `rate_limit` switches and Valkey reconnect
 settings live when the mounted file updates. That is often enough to ride out
 a Valkey blip or walk back break-glass without a new image. It does **not**
 replace a correct first deploy: if Valkey was hard-Init and never came up,
 there was no process left to reload — you needed `degraded_mode` (or Recipe C)
-already on for Initialize to finish. After you are up, reload is the quiet
-lever; watch metrics so “temporary” does not become permanent.
+already on for Initialize to finish.
 
 ## Middleware
 
@@ -716,46 +670,37 @@ idempotency/dedupe of a single delivery, a different concern).
 
 ## Metrics / health
 
-`Health` reports unhealthy before `Init` and after `Shutdown`; after `Init` on
-the sticky-note primary path (`force_memory` / memory-only) it is healthy; with
-a Valkey primary it delegates to the peer's health. `Metrics` returns `nil`
-when not initialized (lazy pattern) or when `metrics_enabled: false`.
+`Health` reports unhealthy before `Init` and after `Shutdown`; after `Init` it
+delegates to the valkey-state peer. `Metrics` returns `nil` when not
+initialized (lazy pattern) or when `metrics_enabled: false`.
 
-Common labels on all series: `component` (= `Name()`). Low-cardinality labels
-only — never raw keys, IPs, or emails.
+Common labels on all series: `component` (= `Name()`), `state` (= peer
+`Name()`). Low-cardinality labels only — never raw keys, IPs, or emails.
+Store-path gauges (memory vs Valkey) live on **valkey-state**.
 
 | Name | Type | Extra labels | Meaning |
 |---|---|---|---|
-| `http_ratelimiter_info` | gauge (0/1) | `backend`=`valkey`\|`memory` | 1 while initialized; describes the active primary backend |
-| `http_ratelimiter_use_memory_fallback` | gauge (0/1) | — | sticky-note engine enabled |
-| `http_ratelimiter_force_memory` | gauge (0/1) | — | break-glass sticky primary enabled |
-| `http_ratelimiter_lame_memory_mode` | gauge (0/1) | — | both switches on while Valkey was healthy (shame) |
+| `http_ratelimiter_info` | gauge (0/1) | — | 1 while initialized |
 | `http_ratelimiter_allows_total` | counter | — | `Allow` / successful `Wait` grant (Allowed=true) |
 | `http_ratelimiter_denies_total` | counter | — | Allowed=false (over limit) |
 | `http_ratelimiter_resets_total` | counter | — | `Reset` calls |
 | `http_ratelimiter_peeks_total` | counter | — | `Peek` calls |
-| `http_ratelimiter_waits_total` | counter | `result`=`ok`\|`canceled`\|`error` | finished `Wait` calls |
-| `http_ratelimiter_wait_duration_seconds_sum` | counter (sum) | — | total seconds spent sleeping inside `Wait` |
-| `http_ratelimiter_wait_duration_seconds_count` | counter | — | number of sleep intervals (mean latency = sum/count) |
-| `http_ratelimiter_storage_errors_total` | counter | — | primary store errors (Valkey transport, etc.) |
-| `http_ratelimiter_memory_path_total` | counter | — | times Allow used the sticky-note path |
-| `http_ratelimiter_missing_ttl_total` | counter | — | scrubbed count>0 / PTTL≤0 keys |
-| `http_ratelimiter_policy_fallbacks_total` | counter | `policy`=`fail_open`\|`fail_closed`\|`memory_fallback` | times a storage-error policy was applied |
-| `http_ratelimiter_map_full_total` | counter | `action`=`allow`\|`deny` | fallback/memory map hit max entries |
-| `http_ratelimiter_memory_entries` | gauge | — | current distinct keys in the in-process map (0 if unused) |
-| `http_ratelimiter_config_reloads_total` | counter | — | successful tunable reloads |
-| `http_ratelimiter_disabled_total` | counter | — | **required** — `Allow`/`Wait`/`AllowWithPolicy` short-circuited because `limit <= 0` (limiter off for that call) |
-| `http_ratelimiter_key_rejected_total` | counter | `reason`=`empty`\|`too_long` | logical key failed validation before storage |
+| `http_ratelimiter_storage_errors_total` | counter | — | errors from valkey-state before FailOpen/FailClosed |
+| `http_ratelimiter_fail_open_total` | counter | — | store error treated as allowed |
+| `http_ratelimiter_fail_closed_total` | counter | — | store error returned to the caller |
+| `http_ratelimiter_disabled_total` | counter | — | `limit <= 0` (limiter off for that call) |
+| `http_ratelimiter_key_rejected_empty_total` | counter | — | empty logical key |
+| `http_ratelimiter_key_rejected_long_total` | counter | — | logical key too long |
 
 Alert on `http_ratelimiter_disabled_total` rising: it means something calls
 `Allow` with `limit <= 0` (see the API section).
 
 ## Tests
 
-Unit tests cover the component contract, sticky-note semantics (counting,
-window reset, map-full allow/deny, sweep, concurrency), key validation, `Wait`
-behavior, middleware validation/policy paths, and the metrics catalogue — no
-external service. Integration tests are gated on `VALKEY_ADDR`:
+Unit tests cover the component contract, key validation, `Wait`, middleware
+validation/policy paths, and the metrics catalogue — no external service.
+Counter Lua / sticky-note math lives in valkey-state tests. Integration tests
+are gated on `VALKEY_ADDR`:
 
 ```bash
 docker run -d --rm -p 6379:6379 --name v valkey/valkey:8
