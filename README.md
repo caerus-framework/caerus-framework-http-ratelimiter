@@ -129,7 +129,7 @@ Valkey is state’s peer, not the limiter’s.
 ```go
 fw := cf.New(&cf.FrameworkOptions{
 	Logs:          &cf.LogsSettings{Format: "json", Level: "info", ConfigSource: "logs"},
-	Observability: &cf.ObservabilitySettings{Address: ":9090", ConfigSource: "observability"},
+	Observability: &cf.ObservabilitySettings{Bind: ":9090", ConfigSource: "observability"},
 	Components: []cf.CaerusComponent{
 		cf_valkey.New(cf_valkey.WithConfigSource("valkey", "config/valkey.json"),
 			cf_valkey.WithKeyPrefix("myservice:")),
