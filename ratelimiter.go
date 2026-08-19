@@ -17,6 +17,7 @@ import (
 
 	cf "github.com/caerus-framework/caerus-framework"
 	cf_configuration "github.com/caerus-framework/caerus-framework-configuration"
+	cf_http "github.com/caerus-framework/caerus-framework-http"
 	cf_logs "github.com/caerus-framework/caerus-framework-logs"
 	cf_observability "github.com/caerus-framework/caerus-framework-observability"
 	cf_valkey_state "github.com/caerus-framework/caerus-framework-valkey-state"
@@ -106,7 +107,16 @@ type MiddlewareConfig struct {
 	KeyFunc      func(*http.Request) string
 	OnStoreError *StorageErrorPolicy
 	Memory       MemoryFallbackConfig
-	OnDenied     func(w http.ResponseWriter, r *http.Request, res Result, status int)
+	// OnDenied overrides the default denial body when set. Retry-After and
+	// optional X-RateLimit-* headers are still applied before OnDenied runs.
+	OnDenied func(w http.ResponseWriter, r *http.Request, res Result, status int)
+	// ErrorWriter is optional. When set and OnDenied is nil, denials use this
+	// writer instead of plain http.Error — pass problem.ErrorWriter from
+	// caerus-framework-http/problem for RFC 9457 JSON. Default off.
+	ErrorWriter cf_http.ErrorWriter
+	// RateLimitHeaders enables X-RateLimit-Limit, X-RateLimit-Remaining, and
+	// X-RateLimit-Reset (Unix seconds) on allowed and denied responses. Default off.
+	RateLimitHeaders bool
 }
 
 // Config is HTTP-limiter settings (not the counter store).
