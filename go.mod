@@ -7,8 +7,8 @@ require (
 	github.com/caerus-framework/caerus-framework-configuration v0.0.13
 	github.com/caerus-framework/caerus-framework-logs v0.0.11
 	github.com/caerus-framework/caerus-framework-observability v0.0.11
-	github.com/caerus-framework/caerus-framework-valkey v0.0.9
-	github.com/caerus-framework/caerus-framework-valkey-state v0.0.10
+	github.com/caerus-framework/caerus-framework-valkey v0.0.10
+	github.com/caerus-framework/caerus-framework-valkey-state v0.0.11
 	github.com/valkey-io/valkey-go v1.0.77
 )
 
@@ -40,8 +40,8 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260818201246-1b0934165a6f // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260818201246-1b0934165a6f // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/grpc v1.83.1 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
