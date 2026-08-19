@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/caerus-framework/caerus-framework v0.0.12
 	github.com/caerus-framework/caerus-framework-configuration v0.0.13
+	github.com/caerus-framework/caerus-framework-http v0.0.10
 	github.com/caerus-framework/caerus-framework-logs v0.0.11
 	github.com/caerus-framework/caerus-framework-observability v0.0.11
 	github.com/caerus-framework/caerus-framework-valkey v0.0.10

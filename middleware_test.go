@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	cf_http "github.com/caerus-framework/caerus-framework-http"
 )
 
 func memRL(t *testing.T) *RateLimiter {
@@ -281,5 +283,86 @@ func TestMiddlewareFailOpenOnStoreError(t *testing.T) {
 	}
 	if r.fbOpen.Load() == 0 {
 		t.Fatal("fail-open policy should have fired (fbOpen counter)")
+	}
+}
+
+func TestMiddlewareErrorWriterOnDenied(t *testing.T) {
+	r := memRL(t)
+	pol := StorageFailOpen
+	var gotCode string
+	mw, err := Middleware(MiddlewareConfig{
+		Limiter:      r,
+		Limit:        1,
+		Window:       time.Minute,
+		KeyFunc:      func(r *http.Request) string { return "k" },
+		OnStoreError: &pol,
+		ErrorWriter: func(w http.ResponseWriter, r *http.Request, f cf_http.Failure) {
+			gotCode = f.Code
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(f.Status)
+			_, _ = w.Write([]byte(`{"status":429}`))
+		},
+	})
+	if err != nil {
+		t.Fatalf("Middleware: %v", err)
+	}
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if gotCode != ErrCodeRateLimitExceeded {
+		t.Fatalf("Failure.Code = %q, want %q", gotCode, ErrCodeRateLimitExceeded)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+	}
+	if retry := rec.Header().Get("Retry-After"); retry == "" {
+		t.Fatal("Retry-After should be set on 429")
+	}
+}
+
+func TestMiddlewareRateLimitHeaders(t *testing.T) {
+	r := memRL(t)
+	pol := StorageFailOpen
+	mw, err := Middleware(MiddlewareConfig{
+		Limiter:          r,
+		Limit:            2,
+		Window:           time.Minute,
+		KeyFunc:          func(r *http.Request) string { return "k" },
+		OnStoreError:     &pol,
+		RateLimitHeaders: true,
+	})
+	if err != nil {
+		t.Fatalf("Middleware: %v", err)
+	}
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Header().Get("X-RateLimit-Limit") != "2" {
+		t.Fatalf("allow Limit = %q, want 2", rec.Header().Get("X-RateLimit-Limit"))
+	}
+	if rec.Header().Get("X-RateLimit-Remaining") != "1" {
+		t.Fatalf("allow Remaining = %q, want 1", rec.Header().Get("X-RateLimit-Remaining"))
+	}
+	if rec.Header().Get("X-RateLimit-Reset") == "" {
+		t.Fatal("allow Reset header missing")
+	}
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("deny status = %d, want 429", rec.Code)
+	}
+	if rec.Header().Get("X-RateLimit-Remaining") != "0" {
+		t.Fatalf("deny Remaining = %q, want 0", rec.Header().Get("X-RateLimit-Remaining"))
 	}
 }

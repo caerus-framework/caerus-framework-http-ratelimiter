@@ -2,10 +2,8 @@ package cf_http_ratelimiter
 
 import (
 	"errors"
-	"math"
 	"net"
 	"net/http"
-	"strconv"
 )
 
 // Middleware builds a stdlib middleware (func(http.Handler) http.Handler) from
@@ -17,7 +15,9 @@ import (
 //
 // The middleware never sleeps. On denial it answers immediately: 429 with a
 // Retry-After header from Result.ResetIn (or 503 for a FailClosed store error,
-// with Retry-After: 1). The client is responsible for waiting.
+// with Retry-After: 1). Default body is plain http.Error; set ErrorWriter
+// (e.g. problem.ErrorWriter) or OnDenied for custom responses. RateLimitHeaders
+// is opt-in. The client is responsible for waiting.
 func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
 	if cfg.Limiter == nil {
 		return nil, errors.New("cf_http_ratelimiter: Middleware: Limiter is required")
@@ -41,26 +41,15 @@ func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
 			if err != nil {
 				// FailClosed store error (or a memory error): the store could
 				// not answer. 503, not 429 — the limiter itself is down.
-				if cfg.OnDenied != nil {
-					cfg.OnDenied(w, r, res, http.StatusServiceUnavailable)
-					return
-				}
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+				writeDefaultDenied(w, r, cfg, res, http.StatusServiceUnavailable)
 				return
 			}
 			if !res.Allowed {
-				if cfg.OnDenied != nil {
-					cfg.OnDenied(w, r, res, http.StatusTooManyRequests)
-					return
-				}
-				secs := int64(math.Ceil(res.ResetIn.Seconds()))
-				if secs <= 0 {
-					secs = 1
-				}
-				w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
-				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+				writeDefaultDenied(w, r, cfg, res, http.StatusTooManyRequests)
 				return
+			}
+			if cfg.RateLimitHeaders {
+				setRateLimitHeaders(w, cfg.Limit, res)
 			}
 			next.ServeHTTP(w, r)
 		})

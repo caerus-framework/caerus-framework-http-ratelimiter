@@ -4,6 +4,8 @@ github.com/caerus-framework/caerus-framework v0.0.12 h1:4UGLoIOXyZUmfMzGLiy0U80h
 github.com/caerus-framework/caerus-framework v0.0.12/go.mod h1:3CzB//+3poSnxabhN6Hc9I4Dg4Qti9dw1s14NisPUw8=
 github.com/caerus-framework/caerus-framework-configuration v0.0.13 h1:uRL85XM3K/qYtODkhr2q1kjgwQAaxEfjkOIiW5IGF58=
 github.com/caerus-framework/caerus-framework-configuration v0.0.13/go.mod h1:b8Pe+QlV28x/srPoZ9Znibo7Fo6cq855yf/j9nAk6qI=
+github.com/caerus-framework/caerus-framework-http v0.0.10 h1:s6+9RtgYeyaIdQt5frU9gzDiN72zjFzlqfrhBTR2NU0=
+github.com/caerus-framework/caerus-framework-http v0.0.10/go.mod h1:O32B0x4gkEEgDSB9xO+G8EgFRZ4F0nal0C1pG6urAIQ=
 github.com/caerus-framework/caerus-framework-logs v0.0.11 h1:AoR19Q3oLe6+GUhRAz7PfsNgjXqnQGbBaR2YMUL7Bz8=
 github.com/caerus-framework/caerus-framework-logs v0.0.11/go.mod h1:dNS//3vAeWlZ2SUxnzYM5vK74w3sJs8RSgfbyInr8V8=
 github.com/caerus-framework/caerus-framework-observability v0.0.11 h1:vEqUAD9Jpws11dvIpWBimrpO7hwHqcVAHXz4fRcQY9o=

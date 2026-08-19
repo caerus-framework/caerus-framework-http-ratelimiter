@@ -309,10 +309,58 @@ door. So:
 - `AllowWithPolicy(ctx, key, limit, window, policy)` **always** takes an
   explicit policy argument — there is no overload that defaults it.
 
-The default `OnDenied` response is `429` with `Retry-After` set from
+The default `OnDenied` response is plain text: `429` with `Retry-After` set from
 `Result.ResetIn` (rounded up, so the client never retries early). A FailClosed
 store error answers `503` with `Retry-After: 1` — the limiter itself is down,
-not the caller. Provide `OnDenied` for custom bodies/status/logging.
+not the caller. Provide `OnDenied` for fully custom bodies/status/logging.
+
+**Opt-in (default off):**
+
+| `MiddlewareConfig` field | Default | When set |
+|---|---|---|
+| `ErrorWriter` | nil (plain `http.Error`) | Pass `problem.ErrorWriter` from `caerus-framework-http/problem` so 429/503 bodies match other `cf_http` middleware (RFC 9457 JSON). Codes: `RATE_LIMIT_EXCEEDED`, `RATE_LIMIT_STORE_UNAVAILABLE`. |
+| `RateLimitHeaders` | `false` | Sets `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (Unix seconds) on allowed **and** denied responses. `Retry-After` is still set on denials. |
+
+```go
+import (
+	cf_http "github.com/caerus-framework/caerus-framework-http"
+	"github.com/caerus-framework/caerus-framework-http/problem"
+)
+
+pol := cf_http_ratelimiter.StorageFailOpen
+mw, err := cf_http_ratelimiter.Middleware(cf_http_ratelimiter.MiddlewareConfig{
+	Limiter:          rl,
+	Limit:            30,
+	Window:           time.Minute,
+	KeyFunc:          ipKeyFunc,
+	OnStoreError:     &pol,
+	ErrorWriter:      problem.ErrorWriter, // opt-in — not the default
+	RateLimitHeaders: true,                // opt-in — not the default
+})
+```
+
+### `Allow` / `Wait` vs middleware on store errors
+
+These three paths are **intentionally different**. Middleware is HTTP-facing and
+forces an explicit policy; direct API callers own their own error handling.
+
+| Path | Store unreachable / error | Who decides |
+|---|---|---|
+| **`Middleware`** | `OnStoreError` required: FailOpen → request proceeds; FailClosed → **503** (+ optional `ErrorWriter` / headers). | You set `OnStoreError` on `MiddlewareConfig`. |
+| **`Allow` / `AllowWithPolicy`** | Returns `(Result{}, err)` — raw store error. Policy only applies when you call `AllowWithPolicy` (FailOpen → `Allowed: true`; FailClosed → error). | Handler / outbound client inspects `err` and `res.Allowed`. |
+| **`Wait` / `WaitOpts`** | Returns `error` immediately on peek or allow failure — **does not sleep through** store outages. | Caller retries or backs off; no built-in FailOpen/FailClosed on `Wait` today. |
+
+Wrong vs right:
+
+```text
+Wrong: "Wait will fail-open like middleware when Valkey is down."
+Right: Wait returns err — use middleware for inbound HTTP; use AllowWithPolicy
+       in handlers; use Wait only when your caller can handle store errors.
+
+Wrong: "Allow without WithPolicy is safe when the store fails."
+Right: Allow returns the raw err — use AllowWithPolicy with an explicit policy
+       when store failure must map to allow/deny.
+```
 
 ## Config and options
 
@@ -370,6 +418,21 @@ loginKey := "login:" + h.Hash(normalizedEmail) // emails are ALWAYS hashed by co
 | Emails / usernames (login lockout) | **Always hash** (`login:` + 64 hex) | secret from app config |
 | IPs (middleware `KeyFunc`) | Plain IP for ops debugging (`ip:203.0.113.4`) | `hash_ip_keys: true` → hash the same way |
 | Installation IDs / non-PII (MyAPIRequestor → ExternalAPIWeCall) | Plain OK (`externalapi:rest:42`) | hash optional |
+
+**`hash_ip_keys` does not auto-hash.** The module stores the flag and exposes
+`RateLimiter.HashIPKeys()` so your app config can read it — but **your
+`KeyFunc` must call `KeyHasher.Hash` (or `HashKey`) when the flag is true.
+Middleware never reads client headers for you.
+
+Wrong vs right:
+
+```text
+Wrong: set "hash_ip_keys": true in http-ratelimiter.json and expect middleware
+       to HMAC RemoteAddr automatically.
+
+Right: read hash_ip_keys (or your app copy of it) inside KeyFunc:
+       if hash { return "ip:" + hasher.Hash(ip) }; return "ip:" + ip
+```
 
 **Never log secrets or pre-hash identities.** After hashing, keys stay short
 and fit the default 256-byte `MaxKeyLength`.
@@ -439,14 +502,15 @@ MyService's own product policy on its own config source (not this component conf
   },
   "rateLimitPolicies": {
     "ipOnStoreError": "fail_open",
-    "loginOnStoreError": "memory_fallback",
+    "loginOnStoreError": "fail_closed",
     "hashIpKeys": false
   },
   "rateLimitKeySecret": "(from secret mount — HMAC key for login/IP hashing)"
 }
 ```
 
-Wiring sketch (Echo) — IP group:
+Wiring sketch (Echo) — IP group. For problem JSON + headers, add
+`ErrorWriter: problem.ErrorWriter` and `RateLimitHeaders: true` (both opt-in):
 
 ```go
 pol := cf_http_ratelimiter.StorageFailOpen
@@ -469,7 +533,8 @@ if err != nil {
 public := e.Group("/api/session", echo.WrapMiddleware(stdMW))
 ```
 
-Login lockout inside the handler — **always hash email**:
+Login lockout inside the handler — **always hash email**; pass
+`StorageFailClosed` (not `memory_fallback` — memory is on valkey-state):
 
 ```go
 loginKey := "login:" + a.keyHasher.Hash(normalizedEmail)
@@ -490,8 +555,32 @@ if success {
 }
 ```
 
-Give the valkey peer `WithKeyPrefix("myservice:")` so keys look like
-`myservice:rl:login:<hex>` — no raw email in the keyspace.
+Give the **valkey** peer `WithKeyPrefix("myservice:")` on `caerus-framework-valkey`
+(not the limiter) so state keys look like `myservice:rl:login:<hex>` — no raw
+email in the keyspace. There is **no** limiter `key_prefix` setting; prefixing
+is the valkey component's job.
+
+### Routers — no stock adapters (Echo, Gin, chi, stdlib)
+
+This module ships **stdlib** `func(http.Handler) http.Handler` only. There is
+no `Echo()`, `Gin()`, or `Chi()` helper in the repo — same policy as
+`caerus-framework-http` (see that module's router examples). Wrap once in your
+app:
+
+| Router | Wrap pattern |
+|---|---|
+| **stdlib / chi** | Use middleware directly: `r.Use(rateMW)` — chi accepts stdlib middleware. |
+| **Echo** | `e.Use(echo.WrapMiddleware(rateMW))` or `e.Group("/api", echo.WrapMiddleware(rateMW))` |
+| **Gin** | `r.Use(gin.WrapH(rateMW(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))))` — or apply on a route group the same way as other `cf_http` middleware |
+
+Wrong vs right:
+
+```text
+Wrong: wait for cf_http_ratelimiter.Echo() in the limiter module.
+
+Right: build Middleware(...) once, wrap with your router's stdlib adapter —
+       identical to how cf_http RequestID / Recover are wired.
+```
 
 ### Recipe B — MyAPIRequestor (we call out; K8s webhook + outbound client)
 
@@ -654,8 +743,9 @@ func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error)
 
 `MiddlewareConfig` requires `Limiter`, `Window > 0`, a `KeyFunc`, and
 `OnStoreError` (see [Storage-error policy](#storage-error-policy)). `Limit <= 0`
-disables rate limiting for this middleware. The returned middleware never
-sleeps: it answers immediately on denial.
+disables rate limiting for this middleware. Optional: `ErrorWriter` (RFC 9457
+JSON via `problem.ErrorWriter`), `RateLimitHeaders`, `OnDenied`. The returned
+middleware never sleeps: it answers immediately on denial.
 
 **KeyFunc must use a trusted client identity.** Do not invent a clever
 `X-Forwarded-For` parser here — use identity your ingress/mesh already
