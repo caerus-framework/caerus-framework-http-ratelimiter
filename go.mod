@@ -48,4 +48,3 @@ require (
 )
 
 tool github.com/caerus-framework/caerus-framework/cmd/caerusvet
-
