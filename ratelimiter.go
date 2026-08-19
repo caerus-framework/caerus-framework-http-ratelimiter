@@ -361,7 +361,7 @@ func (c *RateLimiter) applyConfigFromSource() error {
 	if !ok {
 		return fmt.Errorf("cf_http_ratelimiter: configuration source %q not found", c.configSource)
 	}
-	c.applyConfigLocked(*loaded)
+	c.applyConfigLocked(loaded)
 	return nil
 }
 
