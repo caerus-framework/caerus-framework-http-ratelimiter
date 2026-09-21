@@ -7,15 +7,15 @@ import (
 )
 
 // Middleware builds a stdlib middleware (func(http.Handler) http.Handler) from
-// cfg. It errors when Limiter, KeyFunc, or OnStoreError are nil, or when
-// Window <= 0. OnStoreError is required: choosing this module means tuning
-// store-error policy — there is no silent FailOpen. StorageMemoryFallback
-// requires the limiter's use_memory_fallback capability to be on. MiddlewareConfig.Memory
-// is wired into AllowWithPolicyOpts for per-route sizing overrides.
+// cfg. It errors when Limiter, KeyFunc, or OnStoreError are nil, when Window
+// is <= 0, or when OnStoreError is zero / MemoryFallback. OnStoreError is
+// required: there is no silent FailOpen, and the zero value is not FailOpen.
 //
 // The middleware never sleeps. On denial it answers immediately: 429 with a
-// Retry-After header from Result.ResetIn (or 503 for a FailClosed store error,
-// with Retry-After: 1). Default body is plain http.Error; set ErrorWriter
+// Retry-After header from Result.ResetIn; 503 for a FailClosed store error or
+// uninitialized limiter (Retry-After: 1); 400 when KeyFunc returns an empty
+// or over-long key. FailOpen applies only to store errors, not to those
+// programmer/key failures. Default body is plain http.Error; set ErrorWriter
 // (e.g. problem.ErrorWriter) or OnDenied for custom responses. RateLimitHeaders
 // is opt-in. The client is responsible for waiting.
 func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
@@ -25,8 +25,12 @@ func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
 	if cfg.OnStoreError == nil {
 		return nil, errors.New("cf_http_ratelimiter: Middleware: OnStoreError is required — choosing this module means tuning store-error policy")
 	}
-	if *cfg.OnStoreError == StorageMemoryFallback {
+	switch *cfg.OnStoreError {
+	case StorageFailOpen, StorageFailClosed:
+	case StorageMemoryFallback:
 		return nil, errors.New("cf_http_ratelimiter: Middleware: StorageMemoryFallback is removed; set rate_limit memory on valkey-state")
+	default:
+		return nil, errors.New("cf_http_ratelimiter: Middleware: OnStoreError must be StorageFailOpen or StorageFailClosed (zero is not FailOpen)")
 	}
 	if cfg.KeyFunc == nil {
 		return nil, errors.New("cf_http_ratelimiter: Middleware: KeyFunc is required — use a trusted client identity (e.g. RemoteAddrKey or your mesh's normalized IP), not a client-supplied header")
@@ -39,9 +43,11 @@ func Middleware(cfg MiddlewareConfig) (func(http.Handler) http.Handler, error) {
 			key := cfg.KeyFunc(r)
 			res, err := cfg.Limiter.AllowWithPolicyOpts(r.Context(), key, cfg.Limit, cfg.Window, *cfg.OnStoreError, cfg.Memory)
 			if err != nil {
-				// FailClosed store error (or a memory error): the store could
-				// not answer. 503, not 429 — the limiter itself is down.
-				writeDefaultDenied(w, r, cfg, res, http.StatusServiceUnavailable)
+				status := http.StatusServiceUnavailable
+				if errors.Is(err, ErrEmptyKey) || errors.Is(err, ErrKeyTooLong) {
+					status = http.StatusBadRequest
+				}
+				writeDefaultDenied(w, r, cfg, res, status)
 				return
 			}
 			if !res.Allowed {
