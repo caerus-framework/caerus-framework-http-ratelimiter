@@ -35,12 +35,30 @@ const (
 	defaultMetricsEnabled = true
 )
 
-// ErrMissingTTL is the state's missing-TTL sentinel (errors.Is works).
-var ErrMissingTTL = cf_valkey_state.ErrMissingTTL
+var (
+	// ErrMissingTTL is the state's missing-TTL sentinel (errors.Is works).
+	ErrMissingTTL = cf_valkey_state.ErrMissingTTL
 
-// ErrMemoryFallbackDisabled is returned if a call site still uses
-// StorageMemoryFallback. Memory is chosen on valkey-state, not here.
-var ErrMemoryFallbackDisabled = errors.New("cf_http_ratelimiter: StorageMemoryFallback is removed; set rate_limit memory on valkey-state")
+	// ErrMemoryFallbackDisabled is returned if a call site still uses
+	// StorageMemoryFallback. Memory is chosen on valkey-state, not here.
+	ErrMemoryFallbackDisabled = errors.New("cf_http_ratelimiter: StorageMemoryFallback is removed; set rate_limit memory on valkey-state")
+
+	// ErrEmptyKey is returned when Allow/Peek/Wait/Reset get an empty logical key.
+	ErrEmptyKey = errors.New("cf_http_ratelimiter: empty key")
+	// ErrKeyTooLong is returned when the logical key exceeds MaxKeyLength.
+	ErrKeyTooLong = errors.New("cf_http_ratelimiter: key too long")
+	// ErrNotInitialized is returned when the limiter has no valkey-state peer
+	// (never Init, or Shutdown). FailOpen does not apply.
+	ErrNotInitialized = errors.New("cf_http_ratelimiter: not initialized")
+	// ErrInvalidWindow is returned when window is not greater than zero.
+	ErrInvalidWindow = errors.New("cf_http_ratelimiter: window must be > 0")
+	// ErrWaitZeroReset is returned by Wait when Peek shows usage but ResetIn
+	// is zero or negative. Continuing would busy-loop. This is not a grant.
+	ErrWaitZeroReset = errors.New("cf_http_ratelimiter: Wait saw ResetIn<=0; refusing busy-loop")
+	// ErrUnknownStoragePolicy is returned when AllowWithPolicy gets a zero
+	// or unknown StorageErrorPolicy (zero is not FailOpen).
+	ErrUnknownStoragePolicy = errors.New("cf_http_ratelimiter: unknown storage error policy")
+)
 
 // Result is the HTTP-facing Allow/Peek outcome (same shape as state's RateLimitResult).
 type Result struct {
@@ -54,10 +72,15 @@ func fromState(r cf_valkey_state.RateLimitResult) Result {
 }
 
 // StorageErrorPolicy is what HTTP does when **state already failed**.
+// Zero is invalid — not FailOpen. Products pick a named constant.
 type StorageErrorPolicy int
 
 const (
-	StorageFailOpen StorageErrorPolicy = iota
+	// StorageFailOpen is Store Path B: state error → allow the call.
+	// Availability over abuse control. Not the zero value and not a default.
+	StorageFailOpen StorageErrorPolicy = iota + 1
+	// StorageFailClosed is Store Path A: state error → return the error
+	// (middleware 503). Safer against abuse when Valkey is down.
 	StorageFailClosed
 	// StorageMemoryFallback is no longer a store choice. Using it is an error.
 	StorageMemoryFallback
@@ -258,6 +281,10 @@ type RateLimiter struct {
 	disabled      atomic.Uint64
 	rejectedEmpty atomic.Uint64
 	rejectedLong  atomic.Uint64
+
+	// Test seams (same package). Production leaves these nil.
+	allowHook func(ctx context.Context, key string, limit int64, window time.Duration) (Result, error)
+	peekHook  func(ctx context.Context, key string, opts cf_valkey_state.CounterOpts) (Result, error)
 }
 
 func New(opts ...Option) *RateLimiter {
@@ -406,10 +433,10 @@ func (c *RateLimiter) validateKey(key string) error {
 	switch {
 	case key == "":
 		c.rejectedEmpty.Add(1)
-		return errors.New("cf_http_ratelimiter: empty key")
+		return ErrEmptyKey
 	case len(key) > c.maxLen():
 		c.rejectedLong.Add(1)
-		return fmt.Errorf("cf_http_ratelimiter: key too long (%d bytes, max %d)", len(key), c.maxLen())
+		return fmt.Errorf("%w (%d bytes, max %d)", ErrKeyTooLong, len(key), c.maxLen())
 	}
 	return nil
 }
@@ -427,15 +454,28 @@ func (c *RateLimiter) Allow(ctx context.Context, key string, limit int64, window
 		return c.disabledCall(), nil
 	}
 	if window <= 0 {
-		return Result{}, errors.New("cf_http_ratelimiter: window must be > 0")
+		return Result{}, ErrInvalidWindow
 	}
 	if err := c.validateKey(key); err != nil {
 		return Result{}, err
 	}
+	if c.allowHook != nil {
+		res, err := c.allowHook(ctx, key, limit, window)
+		if err != nil {
+			c.storageErrors.Add(1)
+			return Result{}, err
+		}
+		if res.Allowed {
+			c.allows.Add(1)
+		} else {
+			c.denies.Add(1)
+		}
+		return res, nil
+	}
 	st := c.peer()
 	if st == nil {
 		c.storageErrors.Add(1)
-		return Result{}, errors.New("cf_http_ratelimiter: not initialized")
+		return Result{}, ErrNotInitialized
 	}
 	res, err := st.Allow(ctx, key, limit, window)
 	if err != nil {
@@ -457,7 +497,7 @@ func (c *RateLimiter) Reset(ctx context.Context, key string) error {
 	st := c.peer()
 	if st == nil {
 		c.storageErrors.Add(1)
-		return errors.New("cf_http_ratelimiter: not initialized")
+		return ErrNotInitialized
 	}
 	if err := st.Reset(ctx, key); err != nil {
 		c.storageErrors.Add(1)
@@ -475,10 +515,13 @@ func (c *RateLimiter) peekOpts(ctx context.Context, key string, opts cf_valkey_s
 	if err := c.validateKey(key); err != nil {
 		return Result{}, err
 	}
+	if c.peekHook != nil {
+		return c.peekHook(ctx, key, opts)
+	}
 	st := c.peer()
 	if st == nil {
 		c.storageErrors.Add(1)
-		return Result{}, errors.New("cf_http_ratelimiter: not initialized")
+		return Result{}, ErrNotInitialized
 	}
 	res, err := st.PeekOpts(ctx, key, opts)
 	if err != nil {
@@ -503,7 +546,7 @@ func (c *RateLimiter) WaitOpts(ctx context.Context, key string, limit int64, win
 	}
 	if window <= 0 {
 		c.waitsErr.Add(1)
-		return errors.New("cf_http_ratelimiter: window must be > 0")
+		return ErrInvalidWindow
 	}
 	if err := c.validateKey(key); err != nil {
 		c.waitsErr.Add(1)
@@ -533,11 +576,8 @@ func (c *RateLimiter) WaitOpts(ctx context.Context, key string, limit int64, win
 		}
 		if peeked.Count > 0 && peeked.ResetIn <= 0 {
 			c.logger.Error("cf_http_ratelimiter: Wait saw ResetIn<=0 after peek; refusing busy-loop")
-			if opts.MissingTTLPolicy != nil && *opts.MissingTTLPolicy == MissingTTLError {
-				c.waitsErr.Add(1)
-				return ErrMissingTTL
-			}
-			continue
+			c.waitsErr.Add(1)
+			return ErrWaitZeroReset
 		}
 		sleep, err := c.waitDelayOpts(ctx, key, peeked.ResetIn, opts)
 		if err != nil {
@@ -597,13 +637,23 @@ func (c *RateLimiter) AllowWithPolicy(ctx context.Context, key string, limit int
 	return c.AllowWithPolicyOpts(ctx, key, limit, window, policy, MemoryFallbackConfig{})
 }
 
+// AllowWithPolicyOpts is AllowWithPolicy with a leftover MemoryFallbackConfig
+// argument (ignored; memory lives on valkey-state). FailOpen applies only to
+// store errors on a valid key — empty/long keys and "not initialized" stay
+// errors. Zero policy is ErrUnknownStoragePolicy, not FailOpen.
 func (c *RateLimiter) AllowWithPolicyOpts(ctx context.Context, key string, limit int64, window time.Duration, policy StorageErrorPolicy, _ MemoryFallbackConfig) (Result, error) {
 	if policy == StorageMemoryFallback {
 		return Result{}, ErrMemoryFallbackDisabled
 	}
+	if policy != StorageFailOpen && policy != StorageFailClosed {
+		return Result{}, fmt.Errorf("%w: %d", ErrUnknownStoragePolicy, policy)
+	}
 	res, err := c.Allow(ctx, key, limit, window)
 	if err == nil {
 		return res, nil
+	}
+	if !storeErrorForPolicy(err) {
+		return Result{}, err
 	}
 	switch policy {
 	case StorageFailOpen:
@@ -614,8 +664,21 @@ func (c *RateLimiter) AllowWithPolicyOpts(ctx context.Context, key string, limit
 		c.fbClosed.Add(1)
 		return Result{}, err
 	default:
-		return Result{}, fmt.Errorf("cf_http_ratelimiter: unknown storage error policy %d", policy)
+		return Result{}, fmt.Errorf("%w: %d", ErrUnknownStoragePolicy, policy)
 	}
+}
+
+// storeErrorForPolicy reports whether FailOpen/FailClosed may apply.
+// Key validation, "not initialized", and bad window stay errors.
+func storeErrorForPolicy(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrEmptyKey) || errors.Is(err, ErrKeyTooLong) ||
+		errors.Is(err, ErrNotInitialized) || errors.Is(err, ErrInvalidWindow) {
+		return false
+	}
+	return true
 }
 
 func (c *RateLimiter) HashIPKeys() bool {

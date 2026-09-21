@@ -71,14 +71,14 @@ flowchart TD
   K --> L{limit ≤ 0?}
   L -->|yes| D["ALLOW — no store<br/>disabled_total++"]
   L -->|no| V{validate key}
-  V -->|fail| RJ["error / reject<br/>key_rejected_total"]
+  V -->|fail| RJ["400 — never FailOpen<br/>key_rejected_total"]
   V -->|ok| S["primary store<br/>valkey-state Allow"]
   S -->|OK| C{Count ≤ limit?}
   S -->|store ERROR| P["OnStoreError REQUIRED"]
   C -->|yes| N[next handler]
   C -->|no| DENY["429 + Retry-After<br/>no sleep"]
-  P --> FO[FailOpen → ALLOW warn]
-  P --> FC[FailClosed → DENY/503]
+  P --> FO["Store Path B FailOpen → ALLOW warn"]
+  P --> FC["Store Path A FailClosed → 503"]
 ```
 
 ### Outbound `Wait` — may sleep
@@ -90,8 +90,10 @@ flowchart TD
   Q -->|yes| Allow[Allow once]
   Allow -->|OK| Done[return OK]
   Allow -->|denied| Reset[use ResetIn]
-  Reset --> Sleep
-  Q -->|no| Sleep["sleep ResetIn + jitter<br/>honour ctx"]
+  Q -->|no| Reset
+  Reset --> Z{"ResetIn ≤ 0?"}
+  Z -->|yes| Err["return ErrWaitZeroReset<br/>no busy-loop"]
+  Z -->|no| Sleep["sleep ResetIn + jitter<br/>honour ctx"]
   Sleep --> Peek
 ```
 
@@ -113,8 +115,8 @@ chooses FailOpen vs FailClosed after state already returned an error.
 | Path | Behaviour |
 |---|---|
 | **Inbound** | count → deny fast (429) → **never sleep** |
-| **Outbound** | count → sleep until slot → Allow once |
-| **FailOpen** / **FailClosed** | after state error: let through / deny-or-503 |
+| **Outbound** | count → sleep until slot → Allow once (`ResetIn<=0` → error, not a spin) |
+| **Store Path A / Path B** | after **store** error: FailClosed 503 / FailOpen allow — not on empty keys |
 
 ## Wiring
 
@@ -274,6 +276,11 @@ fully configurable:
 - `WithWaitDelayFunc(fn)` lets the app decide the sleep — cap it, disable it,
   or abort with an error instead of waiting.
 
+If Peek shows the key is in use (`Count > 0`) but `ResetIn` is zero or
+negative, `Wait` returns `ErrWaitZeroReset` immediately. It does **not**
+`continue` with a zero sleep (that was a CPU spin / log flood). Treat it
+like a store bug: retry later or fail the job; it is not a grant.
+
 ### What sleep is not
 
 | Not this | Reality |
@@ -290,24 +297,33 @@ goroutines are not held open.
 
 The limiter talks to **valkey-state**. When **that** call already failed
 (Valkey and sticky notes both unusable, or memory disabled), the call site
-needs a rule:
+needs a rule. FailOpen is **not** a default-safe mode and **not** the zero
+value of the enum (zero is invalid). Empty keys, over-long keys, and
+“not initialized” are never FailOpen — they stay errors (middleware 400 /
+503).
 
-| Rule | Plain English |
-|---|---|
-| **`StorageFailOpen`** | "Store failed → let them in anyway." Site stays up; attackers also get in with no limits. |
-| **`StorageFailClosed`** | "Store failed → nobody gets in." Safer; real users may see 429/503. |
+| Path | Constant | Plain English | Pick when |
+|---|---|---|---|
+| **Store Path A (recommended)** | **`StorageFailClosed`** | Valkey/state down → **503**. Nobody gets in. | Abuse control matters more than staying up (login lockout, webhooks). |
+| **Store Path B** | **`StorageFailOpen`** | Valkey/state down → **allow traffic**. Site stays up; attackers also get in with no limits. | You have a written availability reason (public session IP cap while Valkey blips). |
 
 **`StorageMemoryFallback` is an error.** Valkey vs sticky notes is
 `valkey-state.json` → `rate_limit`, not a per-call policy.
 
-**Why "unset" is dangerous:** in Go, `StorageFailOpen` is the zero value of
-the enum, so "forgot the field" and "I chose FailOpen" look identical. A
-junior can copy middleware, omit `OnStoreError`, and silently ship an unlocked
-door. So:
+```text
+Wrong: omit OnStoreError, or pass StorageErrorPolicy(0), and expect FailOpen
+       “because that used to be iota zero.”
+Right: name Store Path A (FailClosed) or Store Path B (FailOpen) at every
+       middleware / AllowWithPolicy call site.
 
-- `Middleware` **errors** if `OnStoreError` is nil (or is MemoryFallback).
+Wrong: KeyFunc returns "" and FailOpen lets the request through.
+Right: empty / over-long key is always an error (middleware 400). FailOpen
+       only wraps a real store failure on a valid key.
+```
+
+- `Middleware` **errors** if `OnStoreError` is nil, zero, or MemoryFallback.
 - `AllowWithPolicy(ctx, key, limit, window, policy)` **always** takes an
-  explicit policy argument — there is no overload that defaults it.
+  explicit policy argument — zero is `ErrUnknownStoragePolicy`, not FailOpen.
 
 The default `OnDenied` response is plain text: `429` with `Retry-After` set from
 `Result.ResetIn` (rounded up, so the client never retries early). A FailClosed
@@ -348,7 +364,7 @@ forces an explicit policy; direct API callers own their own error handling.
 |---|---|---|
 | **`Middleware`** | `OnStoreError` required: FailOpen → request proceeds; FailClosed → **503** (+ optional `ErrorWriter` / headers). | You set `OnStoreError` on `MiddlewareConfig`. |
 | **`Allow` / `AllowWithPolicy`** | Returns `(Result{}, err)` — raw store error. Policy only applies when you call `AllowWithPolicy` (FailOpen → `Allowed: true`; FailClosed → error). | Handler / outbound client inspects `err` and `res.Allowed`. |
-| **`Wait` / `WaitOpts`** | Returns `error` immediately on peek or allow failure — **does not sleep through** store outages. | Caller retries or backs off; no built-in FailOpen/FailClosed on `Wait` today. |
+| **`Wait` / `WaitOpts`** | Returns `error` immediately on peek or allow failure — **does not sleep through** store outages. `ResetIn<=0` → `ErrWaitZeroReset` (no busy-loop). | Caller retries or backs off; no built-in FailOpen/FailClosed on `Wait` today. |
 
 Wrong vs right:
 
@@ -457,9 +473,9 @@ floods, lock accounts after bad passwords, and stay up if Valkey blips.
 
 | Call site | Policy to start with | Why |
 |---|---|---|
-| IP middleware on public `/api/session/*` | **`StorageFailOpen`** | prefer taking logins over 503ing everyone when Valkey is down |
-| Register | **`StorageFailOpen`** | same availability bias |
-| Login lockout | **`StorageFailClosed`** (enable sticky notes on **valkey-state** `rate_limit` if you still want a per-pod cap when Valkey blips) | key = `login:` + **HMAC hash of email** (never raw email in Valkey) |
+| IP middleware on public `/api/session/*` | **Store Path B** (`StorageFailOpen`) | prefer taking logins over 503ing everyone when Valkey is down — not the default; you named Path B |
+| Register | **Store Path B** (`StorageFailOpen`) | same availability bias |
+| Login lockout | **Store Path A** (`StorageFailClosed`; enable sticky notes on **valkey-state** `rate_limit` if you still want a per-pod cap when Valkey blips) | key = `login:` + **HMAC hash of email** (never raw email in Valkey) |
 | Map full (fallback) | **explicit** `allow` or `deny` | no silent default |
 | On success | **`Reset` the same hashed key** | clear the counter so a successful user is not half-locked |
 | IP keys | plain or hashed | start plain for ops; set `hash_ip_keys: true` when Valkey is shared / privacy-sensitive |

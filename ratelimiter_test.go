@@ -2,7 +2,9 @@ package cf_http_ratelimiter
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,20 +117,93 @@ func TestStorageMemoryFallbackRejected(t *testing.T) {
 	}
 }
 
-func TestFailOpen(t *testing.T) {
-	st := cf_valkey_state.New() // requires valkey, no client
+func TestFailOpenOnStoreError(t *testing.T) {
+	st := memoryState(t)
 	r := New()
-	fw := cf.New()
-	_ = fw.AddComponent(st)
-	_ = fw.AddComponent(r)
-	// state Init fails without valkey — use memory state instead and
-	// FailClosed/Open only when state errors. Empty-key already tested.
-	st = memoryState(t)
-	r = New()
 	initLimiter(t, r, st)
+	r.allowHook = func(ctx context.Context, key string, limit int64, window time.Duration) (Result, error) {
+		return Result{}, errors.New("valkey down")
+	}
 	res, err := r.AllowWithPolicy(context.Background(), "k", 1, time.Minute, StorageFailOpen)
 	if err != nil || !res.Allowed {
-		t.Fatalf("fail-open happy path = %+v %v", res, err)
+		t.Fatalf("fail-open store error = %+v %v", res, err)
+	}
+	if r.fbOpen.Load() == 0 {
+		t.Fatal("fbOpen should increment")
+	}
+}
+
+func TestFailOpenDoesNotAllowEmptyKey(t *testing.T) {
+	st := memoryState(t)
+	r := New()
+	initLimiter(t, r, st)
+	res, err := r.AllowWithPolicy(context.Background(), "", 1, time.Minute, StorageFailOpen)
+	if !errors.Is(err, ErrEmptyKey) || res.Allowed {
+		t.Fatalf("empty key FailOpen = %+v %v, want ErrEmptyKey and not allowed", res, err)
+	}
+	if r.fbOpen.Load() != 0 {
+		t.Fatal("empty key must not increment fail-open")
+	}
+}
+
+func TestFailOpenDoesNotAllowLongKey(t *testing.T) {
+	st := memoryState(t)
+	r := New(WithMaxKeyLength(8))
+	initLimiter(t, r, st)
+	res, err := r.AllowWithPolicy(context.Background(), strings.Repeat("a", 9), 1, time.Minute, StorageFailOpen)
+	if !errors.Is(err, ErrKeyTooLong) || res.Allowed {
+		t.Fatalf("long key FailOpen = %+v %v, want ErrKeyTooLong and not allowed", res, err)
+	}
+	if r.fbOpen.Load() != 0 {
+		t.Fatal("long key must not increment fail-open")
+	}
+}
+
+func TestFailOpenDoesNotAllowWhenNotInitialized(t *testing.T) {
+	r := New()
+	res, err := r.AllowWithPolicy(context.Background(), "k", 1, time.Minute, StorageFailOpen)
+	if !errors.Is(err, ErrNotInitialized) || res.Allowed {
+		t.Fatalf("not initialized FailOpen = %+v %v, want ErrNotInitialized and not allowed", res, err)
+	}
+	if r.fbOpen.Load() != 0 {
+		t.Fatal("not initialized must not increment fail-open")
+	}
+}
+
+func TestZeroStoragePolicyRejected(t *testing.T) {
+	st := memoryState(t)
+	r := New()
+	initLimiter(t, r, st)
+	_, err := r.AllowWithPolicy(context.Background(), "k", 1, time.Minute, StorageErrorPolicy(0))
+	if !errors.Is(err, ErrUnknownStoragePolicy) {
+		t.Fatalf("zero policy = %v, want ErrUnknownStoragePolicy", err)
+	}
+}
+
+func TestWaitRefusesZeroResetIn(t *testing.T) {
+	st := memoryState(t)
+	r := New(WithWaitJitterMax(0))
+	initLimiter(t, r, st)
+	r.peekHook = func(ctx context.Context, key string, opts cf_valkey_state.CounterOpts) (Result, error) {
+		return Result{Count: 1, ResetIn: 0}, nil
+	}
+	var delayCalls atomic.Uint64
+	r.waitDelayFunc = func(ctx context.Context, key string, base, jittered time.Duration) (time.Duration, error) {
+		delayCalls.Add(1)
+		return 0, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := r.Wait(ctx, "k", 1, time.Minute)
+	if !errors.Is(err, ErrWaitZeroReset) {
+		t.Fatalf("Wait = %v, want ErrWaitZeroReset", err)
+	}
+	if time.Since(start) > 50*time.Millisecond {
+		t.Fatalf("Wait took %s; busy-looped toward deadline", time.Since(start))
+	}
+	if delayCalls.Load() != 0 {
+		t.Fatalf("DelayFunc called %d times; Wait must return before sleep", delayCalls.Load())
 	}
 }
 

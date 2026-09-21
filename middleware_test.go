@@ -1,6 +1,8 @@
 package cf_http_ratelimiter
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,6 +40,7 @@ func TestMiddlewareRequiresOnStoreError(t *testing.T) {
 func TestMiddlewareValidationErrors(t *testing.T) {
 	r := memRL(t)
 	pol := StorageFailOpen
+	var zero StorageErrorPolicy
 	cases := []struct {
 		name string
 		cfg  MiddlewareConfig
@@ -47,6 +50,7 @@ func TestMiddlewareValidationErrors(t *testing.T) {
 		{"zero window", MiddlewareConfig{Limiter: r, Window: 0, OnStoreError: &pol, KeyFunc: RemoteAddrKey}, "Window"},
 		{"negative window", MiddlewareConfig{Limiter: r, Window: -time.Second, OnStoreError: &pol, KeyFunc: RemoteAddrKey}, "Window"},
 		{"nil keyfunc", MiddlewareConfig{Limiter: r, Window: time.Minute, OnStoreError: &pol}, "KeyFunc"},
+		{"zero policy", MiddlewareConfig{Limiter: r, Window: time.Minute, OnStoreError: &zero, KeyFunc: RemoteAddrKey}, "OnStoreError"},
 	}
 	for _, tc := range cases {
 		if _, err := Middleware(tc.cfg); err == nil {
@@ -234,7 +238,10 @@ func TestMiddlewareRejectsMemoryFallbackPolicy(t *testing.T) {
 }
 
 func TestMiddlewareFailClosedOnStoreError(t *testing.T) {
-	r := New() // no memory, no Init → store always errors
+	r := memRL(t)
+	r.allowHook = func(ctx context.Context, key string, limit int64, window time.Duration) (Result, error) {
+		return Result{}, errors.New("valkey down")
+	}
 	pol := StorageFailClosed
 	mw, err := Middleware(MiddlewareConfig{
 		Limiter:      r,
@@ -261,8 +268,36 @@ func TestMiddlewareFailClosedOnStoreError(t *testing.T) {
 	}
 }
 
+func TestMiddlewareNotInitializedIs503(t *testing.T) {
+	r := New()
+	pol := StorageFailClosed
+	mw, err := Middleware(MiddlewareConfig{
+		Limiter:      r,
+		Limit:        10,
+		Window:       time.Minute,
+		KeyFunc:      func(r *http.Request) string { return "k" },
+		OnStoreError: &pol,
+	})
+	if err != nil {
+		t.Fatalf("Middleware: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if r.fbClosed.Load() != 0 {
+		t.Fatal("not initialized must not count as FailClosed store policy")
+	}
+}
+
 func TestMiddlewareFailOpenOnStoreError(t *testing.T) {
-	r := New() // no memory, no Init → store always errors
+	r := memRL(t)
+	r.allowHook = func(ctx context.Context, key string, limit int64, window time.Duration) (Result, error) {
+		return Result{}, errors.New("valkey down")
+	}
 	pol := StorageFailOpen
 	mw, err := Middleware(MiddlewareConfig{
 		Limiter:      r,
@@ -279,10 +314,60 @@ func TestMiddlewareFailOpenOnStoreError(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (fail-open)", rec.Code)
+		t.Fatalf("status = %d, want 200 (fail-open store error)", rec.Code)
 	}
 	if r.fbOpen.Load() == 0 {
 		t.Fatal("fail-open policy should have fired (fbOpen counter)")
+	}
+}
+
+func TestMiddlewareFailOpenDoesNotBypassEmptyKey(t *testing.T) {
+	r := memRL(t)
+	pol := StorageFailOpen
+	mw, err := Middleware(MiddlewareConfig{
+		Limiter:      r,
+		Limit:        10,
+		Window:       time.Minute,
+		KeyFunc:      func(r *http.Request) string { return "" },
+		OnStoreError: &pol,
+	})
+	if err != nil {
+		t.Fatalf("Middleware: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (empty key, not fail-open)", rec.Code)
+	}
+	if r.fbOpen.Load() != 0 {
+		t.Fatal("empty key must not increment fail-open")
+	}
+}
+
+func TestMiddlewareFailOpenDoesNotBypassNotInitialized(t *testing.T) {
+	r := New()
+	pol := StorageFailOpen
+	mw, err := Middleware(MiddlewareConfig{
+		Limiter:      r,
+		Limit:        10,
+		Window:       time.Minute,
+		KeyFunc:      func(r *http.Request) string { return "k" },
+		OnStoreError: &pol,
+	})
+	if err != nil {
+		t.Fatalf("Middleware: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (not initialized, not fail-open)", rec.Code)
+	}
+	if r.fbOpen.Load() != 0 {
+		t.Fatal("not initialized must not increment fail-open")
 	}
 }
 
